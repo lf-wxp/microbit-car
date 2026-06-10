@@ -105,7 +105,70 @@ impl RadioHeader {
 /// - vy: lateral speed (-100 to +100), positive = right strafe
 /// - omega: rotation speed (-100 to +100), positive = clockwise
 ///
-/// Motion examples for Mecanum wheels:
+/// # Inverse Kinematics: Payload -> Motor PWM
+///
+/// Mecanum wheel layout (top view):
+/// ```text
+///        Front
+///   FL \\      / FR      (roller angles: FL=45°, FR=-45°)
+///       [body]
+///   RL /      \\ RR      (roller angles: RL=-45°, RL=45°)
+///        Rear
+/// ```
+///
+/// The inverse kinematics formula converts (vx, vy, omega) into individual
+/// wheel speeds. For a standard Mecanum chassis where L = half wheelbase
+/// and W = half track width:
+///
+/// ```text
+///   motor_FL = vx - vy - (L + W) * omega
+///   motor_FR = vx + vy + (L + W) * omega
+///   motor_RL = vx + vy - (L + W) * omega
+///   motor_RR = vx - vy + (L + W) * omega
+/// ```
+///
+/// Since our payload uses normalized values (-100..+100) and the geometry
+/// factor (L + W) is constant for a given chassis, we simplify by folding
+/// it into a tunable constant K (typically 0.5~1.0 depending on chassis):
+///
+/// ```text
+///   let k: f32 = 1.0;  // geometry factor, tune per chassis
+///   motor_fl = vx - vy - k * omega
+///   motor_fr = vx + vy + k * omega
+///   motor_rl = vx + vy - k * omega
+///   motor_rr = vx - vy + k * omega
+/// ```
+///
+/// After computing raw motor values, normalize to PWM range:
+/// ```text
+///   // Find the max absolute value among all 4 motors
+///   let max_val = max(|motor_fl|, |motor_fr|, |motor_rl|, |motor_rr|);
+///   // If any motor exceeds 100, scale all proportionally
+///   if max_val > 100 {
+///       motor_fl = motor_fl * 100 / max_val;
+///       motor_fr = motor_fr * 100 / max_val;
+///       motor_rl = motor_rl * 100 / max_val;
+///       motor_rr = motor_rr * 100 / max_val;
+///   }
+///   // Positive = forward rotation, negative = reverse rotation
+///   // Map absolute value to PWM duty cycle (0~100% of max RPM)
+/// ```
+///
+/// # Worked Example
+///
+/// Given payload: vx=70, vy=70, omega=0 (diagonal front-right), k=1.0:
+/// ```text
+///   motor_fl = 70 - 70 - 0 =   0   (stopped)
+///   motor_fr = 70 + 70 + 0 = 140   (full forward, will be scaled)
+///   motor_rl = 70 + 70 - 0 = 140   (full forward, will be scaled)
+///   motor_rr = 70 - 70 + 0 =   0   (stopped)
+///   // After normalization (max=140):
+///   motor_fl =  0, motor_fr = 100, motor_rl = 100, motor_rr = 0
+/// ```
+/// Result: only FR and RL spin forward -> car moves diagonally front-right. ✓
+///
+/// # Motion Examples
+///
 ///   vx=100,  vy=0,    omega=0   -> move forward
 ///   vx=-100, vy=0,    omega=0   -> move backward
 ///   vx=0,    vy=100,  omega=0   -> strafe right
