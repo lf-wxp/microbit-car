@@ -16,6 +16,7 @@ defmt-rtt.workspace = true
 panic-probe.workspace = true
 static_cell.workspace = true
 protocol.workspace = true
+radio-core.workspace = true
 
 [[bin]]
 name = "controller"

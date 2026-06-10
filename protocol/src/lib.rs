@@ -193,22 +193,38 @@ impl MotionPayload {
 
   /// Create a stop motion (all zeros)
   pub fn stop() -> Self {
-    Self { vx: 0, vy: 0, omega: 0 }
+    Self {
+      vx: 0,
+      vy: 0,
+      omega: 0,
+    }
   }
 
   /// Create a forward motion
   pub fn forward(speed: i8) -> Self {
-    Self { vx: speed, vy: 0, omega: 0 }
+    Self {
+      vx: speed,
+      vy: 0,
+      omega: 0,
+    }
   }
 
   /// Create a lateral (strafe) motion
   pub fn strafe(speed: i8) -> Self {
-    Self { vx: 0, vy: speed, omega: 0 }
+    Self {
+      vx: 0,
+      vy: speed,
+      omega: 0,
+    }
   }
 
   /// Create a rotation-only motion
   pub fn rotate(speed: i8) -> Self {
-    Self { vx: 0, vy: 0, omega: speed }
+    Self {
+      vx: 0,
+      vy: 0,
+      omega: speed,
+    }
   }
 
   /// Serialize motion to bytes
@@ -231,9 +247,9 @@ impl MotionPayload {
   /// Clamp all values to valid range [-100, 100]
   pub fn clamped(self) -> Self {
     Self {
-      vx: self.vx.max(-100).min(100),
-      vy: self.vy.max(-100).min(100),
-      omega: self.omega.max(-100).min(100),
+      vx: self.vx.clamp(-100, 100),
+      vy: self.vy.clamp(-100, 100),
+      omega: self.omega.clamp(-100, 100),
     }
   }
 }
@@ -371,15 +387,15 @@ impl RadioPacket {
     }
   }
 
-  /// Set payload data
-  pub fn set_payload(&mut self, data: &[u8]) -> Result<(), ()> {
+  /// Set payload data. Returns false if data exceeds MAX_PAYLOAD_SIZE.
+  pub fn set_payload(&mut self, data: &[u8]) -> bool {
     if data.len() > MAX_PAYLOAD_SIZE {
-      return Err(());
+      return false;
     }
     self.payload[..data.len()].copy_from_slice(data);
     self.payload_len = data.len() as u8;
     self.header.payload_len = data.len() as u8;
-    Ok(())
+    true
   }
 
   /// Get payload data slice
@@ -401,8 +417,7 @@ impl RadioPacket {
     let header_bytes = self.header.to_bytes();
     buf[..RadioHeader::SIZE].copy_from_slice(&header_bytes);
     let payload_end = RadioHeader::SIZE + self.payload_len as usize;
-    buf[RadioHeader::SIZE..payload_end]
-      .copy_from_slice(&self.payload[..self.payload_len as usize]);
+    buf[RadioHeader::SIZE..payload_end].copy_from_slice(&self.payload[..self.payload_len as usize]);
     // Append XOR checksum after payload
     let checksum = compute_checksum(&buf[..payload_end]);
     buf[payload_end] = checksum;
@@ -434,9 +449,9 @@ impl RadioPacket {
       return None;
     }
     let mut packet = Self::new(header.msg_type, header.seq);
-    packet
-      .set_payload(&bytes[RadioHeader::SIZE..data_end])
-      .ok()?;
+    if !packet.set_payload(&bytes[RadioHeader::SIZE..data_end]) {
+      return None;
+    }
     Some(packet)
   }
 }
@@ -447,7 +462,7 @@ impl RadioPacket {
 pub fn create_motion_packet(seq: u8, vx: i8, vy: i8, omega: i8) -> RadioPacket {
   let mut packet = RadioPacket::new(MessageType::Motion, seq);
   let motion = MotionPayload { vx, vy, omega }.clamped();
-  packet.set_payload(&motion.to_bytes()).ok();
+  packet.set_payload(&motion.to_bytes());
   packet
 }
 
@@ -460,7 +475,7 @@ pub fn create_emergency_stop_packet(seq: u8) -> RadioPacket {
 pub fn create_response_packet(seq: u8, status: CarStatus, info: u8) -> RadioPacket {
   let mut packet = RadioPacket::new(MessageType::Response, seq);
   let resp = ResponsePayload { status, info };
-  packet.set_payload(&resp.to_bytes()).ok();
+  packet.set_payload(&resp.to_bytes());
   packet
 }
 
@@ -472,6 +487,6 @@ pub fn create_heartbeat_packet(seq: u8) -> RadioPacket {
 /// Create a telemetry packet
 pub fn create_telemetry_packet(seq: u8, telemetry: TelemetryPayload) -> RadioPacket {
   let mut packet = RadioPacket::new(MessageType::Telemetry, seq);
-  packet.set_payload(&telemetry.to_bytes()).ok();
+  packet.set_payload(&telemetry.to_bytes());
   packet
 }

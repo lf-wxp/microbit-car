@@ -1,0 +1,15 @@
+[package]
+name = "radio-core"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+embassy-nrf.workspace = true
+embassy-time.workspace = true
+defmt.workspace = true
+protocol.workspace = true
+
+# Disable test/bench targets since this is a no_std embedded library
+[lib]
+test = false
+bench = false
