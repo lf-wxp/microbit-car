@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+  "controller",
+  "car",
+  "protocol",
+]
+
+[workspace.dependencies]
+# Embassy async runtime for embedded
+embassy-executor = { version = "0.7.0", features = ["arch-cortex-m", "executor-thread"] }
+embassy-time = { version = "0.4.0", features = ["tick-hz-32_768"] }
+embassy-nrf = { version = "0.3.0", features = ["nrf52833", "time-driver-rtc1", "gpiote"] }
+embassy-sync = { version = "0.6.2" }
+embassy-futures = { version = "0.1.1" }
+
+# Cortex-M support
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+
+# Defmt logging framework for embedded
+defmt = "1.0"
+defmt-rtt = "1.0"
+
+# Panic handler using defmt + probe-rs
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+# Static cell for embassy executor
+static_cell = "2.1"
+
+# Protocol crate (local)
+protocol = { path = "protocol" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+debug = 2
+
+[profile.dev]
+opt-level = 1
+debug = 2

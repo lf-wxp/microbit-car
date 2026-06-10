@@ -1,0 +1,16 @@
+[package]
+name = "protocol"
+version = "0.0.0"
+edition = "2024"
+
+# No standard library dependency, suitable for embedded systems
+# The library entry point is src/lib.rs
+[dependencies]
+# Defmt for formatted output in embedded systems
+defmt = "1.1.0"
+
+# Disable test/bench targets since this is a no_std embedded library
+# The `test` crate is unavailable on thumbv7em-none-eabihf (bare-metal target)
+[lib]
+test = false
+bench = false
