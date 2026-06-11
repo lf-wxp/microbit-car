@@ -1,22 +1,22 @@
 [workspace]
-resolver = "3"
 members = [
   "controller",
   "car",
   "protocol",
   "radio-core",
 ]
+resolver = "3"
 
 [workspace.dependencies]
 # Embassy async runtime for embedded
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
-embassy-time = { version = "0.5.1", features = ["tick-hz-32_768"] }
-embassy-nrf = { version = "0.10.0", features = ["nrf52833", "time-driver-rtc1", "gpiote", "defmt"] }
-embassy-sync = { version = "0.8.0" }
-embassy-futures = { version = "0.1.1" }
+embassy-executor = {version = "0.10.0", features = ["platform-cortex-m", "executor-thread"]}
+embassy-futures = {version = "0.1.1"}
+embassy-nrf = {version = "0.10.0", features = ["nrf52833", "time-driver-rtc1", "gpiote", "defmt"]}
+embassy-sync = {version = "0.8.0"}
+embassy-time = {version = "0.5.1", features = ["tick-hz-32_768"]}
 
 # Cortex-M support
-cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m = {version = "0.7.7", features = ["inline-asm", "critical-section-single-core"]}
 cortex-m-rt = "0.7.5"
 
 # Defmt logging framework for embedded
@@ -24,23 +24,23 @@ defmt = "1.0"
 defmt-rtt = "1.2.0"
 
 # Panic handler using defmt + probe-rs
-panic-probe = { version = "1.0", features = ["print-defmt"] }
+panic-probe = {version = "1.0", features = ["print-defmt"]}
 
 # Static cell for embassy executor
 static_cell = "2.1"
 
 # Protocol crate (local)
-protocol = { path = "protocol" }
+protocol = {path = "protocol"}
 
 # Shared radio core (local)
-radio-core = { path = "radio-core" }
+radio-core = {path = "radio-core"}
 
 [profile.release]
 codegen-units = 1
+debug = 2
 lto = true
 opt-level = "z"
-debug = 2
 
 [profile.dev]
-opt-level = 1
 debug = 2
+opt-level = 1

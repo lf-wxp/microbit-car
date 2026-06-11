@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+mod motor;
+mod motorbit;
+mod pca9685;
 mod radio;
 
 use defmt_rtt as _;
@@ -10,7 +13,6 @@ use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 
 use defmt::info;
-use protocol::MotionPayload;
 
 /// Main entry point for the car firmware
 /// Runs on micro:bit v2 (nRF52833)
@@ -28,54 +30,27 @@ async fn main(spawner: Spawner) {
   let radio = radio::init(p.RADIO);
   spawner.spawn(radio::radio_rx_task(radio).unwrap());
 
-  info!("Radio RX task spawned, entering main loop");
+  info!("Radio RX task spawned");
 
-  // Main loop: process motion commands from radio
+  // Initialize motor driver (PCA9685 via I2C)
+  // micro:bit v2 edge connector: P19(SCL)=P0.26, P20(SDA)=P1.00
+  let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
+
+  info!("Motor driver initialized, entering main loop");
+
+  // Main loop: process motion commands from radio and drive motors
   loop {
     // Wait for a motion command from the radio task
     let motion = radio::MOTION_CHANNEL.receive().await;
 
     // Blink LED based on motion state
     if motion.vx != 0 || motion.vy != 0 || motion.omega != 0 {
-      // Moving: LED on
       led_col1.set_high();
     } else {
-      // Stopped: LED off
       led_col1.set_low();
     }
 
-    // TODO: Apply motion to Mecanum wheel motors
-    // The inverse kinematics formula (see protocol docs):
-    //   motor_fl = vx - vy - k * omega
-    //   motor_fr = vx + vy + k * omega
-    //   motor_rl = vx + vy - k * omega
-    //   motor_rr = vx - vy + k * omega
-    handle_motion(&motion);
+    // Apply motion to Mecanum wheel motors via PCA9685
+    motor_driver.apply_motion(&motion).await;
   }
-}
-
-/// Apply motion command to motors (placeholder for actual motor control)
-fn handle_motion(motion: &MotionPayload) {
-  if motion.vx == 0 && motion.vy == 0 && motion.omega == 0 {
-    defmt::trace!("Motors: STOP");
-    return;
-  }
-
-  // Mecanum inverse kinematics (k=1.0 for simplicity)
-  let vx = motion.vx as i16;
-  let vy = motion.vy as i16;
-  let omega = motion.omega as i16;
-
-  let motor_fl = vx - vy - omega;
-  let motor_fr = vx + vy + omega;
-  let motor_rl = vx + vy - omega;
-  let motor_rr = vx - vy + omega;
-
-  defmt::trace!(
-    "Motors: FL={}, FR={}, RL={}, RR={}",
-    motor_fl,
-    motor_fr,
-    motor_rl,
-    motor_rr
-  );
 }

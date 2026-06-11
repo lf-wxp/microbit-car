@@ -1,5 +1,6 @@
 {
 	"words": [
+		"ALLCALL",
 		"balen",
 		"codegen",
 		"crccnf",
@@ -21,6 +22,7 @@
 		"Mbit",
 		"Mecanum",
 		"microbit",
+		"motorbit",
 		"MSVC",
 		"nonconn",
 		"NVIC",
@@ -35,7 +37,11 @@
 		"saadc",
 		"serde",
 		"statlen",
+		"SUBADR",
 		"thumbv",
+		"twim",
+		"TWIS",
+		"TWISPI",
 		"txaddress",
 		"txen",
 		"txpower",
