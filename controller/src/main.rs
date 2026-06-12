@@ -2,6 +2,7 @@
 #![no_main]
 
 mod button;
+mod display;
 mod joystick;
 mod joystick_right;
 mod mode;
@@ -14,7 +15,6 @@ use panic_probe as _;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either4, select, select4};
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_time::{Duration, Timer};
 
 use defmt::info;
@@ -38,11 +38,16 @@ fn merge_omega(stick: i8, button: i8) -> i8 {
 async fn main(spawner: Spawner) {
   let p = embassy_nrf::init(Default::default());
 
-  // LED row 1, col 1 on micro:bit v2 (top-left LED) - connection indicator
-  let mut led_col1 = Output::new(p.P0_28, Level::Low, OutputDrive::Standard);
-  let mut _led_row1 = Output::new(p.P0_21, Level::High, OutputDrive::Standard);
-
   info!("Controller firmware started");
+
+  // Initialize the on-board 5x5 LED matrix and spawn the display task.
+  // Pin assignments come from the official micro:bit v2 schematic:
+  //   ROW1=P0.21, ROW2=P0.22, ROW3=P0.15, ROW4=P0.24, ROW5=P0.19
+  //   COL1=P0.28, COL2=P0.11, COL3=P0.31, COL4=P1.05, COL5=P0.30
+  let matrix = display::init(
+    p.P0_21, p.P0_22, p.P0_15, p.P0_24, p.P0_19, p.P0_28, p.P0_11, p.P0_31, p.P1_05, p.P0_30,
+  );
+  spawner.spawn(display::display_task(matrix).unwrap());
 
   // Initialize radio and spawn radio task
   let radio = radio::init(p.RADIO);
@@ -163,9 +168,14 @@ async fn main(spawner: Spawner) {
     };
     radio::MOTION_TX_CHANNEL.send(combined).await;
 
-    // Blink LED to indicate activity
-    led_col1.set_high();
-    Timer::after(Duration::from_millis(20)).await;
-    led_col1.set_low();
+    // Mirror the command to the LED matrix. `try_send` keeps the
+    // fusion loop non-blocking even if the display task hasn't drained
+    // the previous value yet (the channel has capacity 1, so the
+    // freshest frame always wins).
+    let _ = display::DISPLAY_CHANNEL.try_send(combined);
+
+    // Tiny pacing delay keeps the loop from spinning when several
+    // sources fire in the same tick.
+    Timer::after(Duration::from_millis(1)).await;
   }
 }

@@ -38,6 +38,7 @@
 		"rustup",
 		"saadc",
 		"serde",
+		"signum",
 		"statlen",
 		"SUBADR",
 		"thumbv",
