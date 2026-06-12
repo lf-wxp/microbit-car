@@ -18,6 +18,17 @@ static_cell.workspace = true
 protocol.workspace = true
 radio-core.workspace = true
 
+[features]
+# Default build uses the mock right-stick source so the fusion pipeline
+# works end-to-end even without the second joystick wired up.
+default = []
+
+# Enable when the second joystick is physically wired up. Finish the
+# `RightStickSource::new(...)` constructor in
+# `src/joystick_right.rs` and the corresponding spawn site in
+# `src/main.rs` before building with this feature.
+right-stick-hw = []
+
 [[bin]]
 name = "controller"
 bench = false

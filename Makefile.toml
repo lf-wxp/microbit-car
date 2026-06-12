@@ -32,6 +32,12 @@ workspace = false
 command = "cargo"
 args = ["build", "--release", "-p", "controller"]
 
+[tasks.build-controller-rs]
+description = "Build controller firmware with right-stick hardware enabled"
+workspace = false
+command = "cargo"
+args = ["build", "--release", "-p", "controller", "--features", "right-stick-hw"]
+
 [tasks.build-protocol]
 description = "Build protocol library"
 workspace = false
@@ -53,6 +59,13 @@ args = ["run", "--chip", "${CHIP}", "target/${CARGO_TARGET}/release/car"]
 description = "Flash controller firmware to micro:bit"
 workspace = false
 dependencies = ["build-controller"]
+command = "probe-rs"
+args = ["run", "--chip", "${CHIP}", "target/${CARGO_TARGET}/release/controller"]
+
+[tasks.flash-controller-rs]
+description = "Flash controller firmware (right-stick hardware enabled) to micro:bit"
+workspace = false
+dependencies = ["build-controller-rs"]
 command = "probe-rs"
 args = ["run", "--chip", "${CHIP}", "target/${CARGO_TARGET}/release/controller"]
 

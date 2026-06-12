@@ -11,7 +11,7 @@ resolver = "3"
 # Embassy async runtime for embedded
 embassy-executor = {version = "0.10.0", features = ["platform-cortex-m", "executor-thread"]}
 embassy-futures = {version = "0.1.1"}
-embassy-nrf = {version = "0.10.0", features = ["nrf52833", "time-driver-rtc1", "gpiote", "defmt"]}
+embassy-nrf = {version = "0.10.0", features = ["nrf52833", "time-driver-rtc1", "gpiote", "defmt", "nfc-pins-as-gpio"]}
 embassy-sync = {version = "0.8.0"}
 embassy-time = {version = "0.5.1", features = ["tick-hz-32_768"]}
 

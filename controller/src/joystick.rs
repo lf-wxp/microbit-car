@@ -4,8 +4,8 @@
 //! - Y-axis: P1 (AIN2) — forward/backward (up=1023, down=0)
 //! - X-axis: P2 (AIN3) — left/right (right=1023, left=0)
 //!
-//! Applies dead zone filtering and exponential moving average (EMA) smoothing
-//! to produce stable MotionPayload values for Mecanum wheel control.
+//! The DSP pipeline (dead zone + scale + EMA smoothing) lives in
+//! [`crate::signal`] so the right-stick driver can reuse the same maths.
 
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::saadc::{ChannelConfig, Config, InterruptHandler, Saadc};
@@ -16,113 +16,57 @@ use embassy_sync::channel::Channel;
 use defmt::{info, trace};
 use protocol::MotionPayload;
 
-// Bind SAADC interrupt to the handler
-bind_interrupts!(struct Irqs {
+use crate::mode::{self, InputMode};
+use crate::signal::{self, ADC_MAX, DEFAULT_DEAD_ZONE, EmaFilter};
+
+// Bind SAADC interrupt to the handler. Made `pub(crate)` so the
+// right-stick driver can reuse the same binding instead of declaring
+// a second one (which would clash on the SAADC symbol).
+bind_interrupts!(pub(crate) struct Irqs {
   SAADC => InterruptHandler;
 });
-
-// --- Configuration Constants ---
-
-/// ADC resolution: 10-bit (0..1023)
-const ADC_MAX: i16 = 1023;
-
-/// ADC midpoint (joystick center position)
-const ADC_MID: i16 = ADC_MAX / 2; // 511
-
-/// Dead zone threshold (±DEAD_ZONE around center is treated as zero)
-/// ~5% of half-range to filter out joystick drift and noise
-const DEAD_ZONE: i16 = 30;
-
-/// EMA smoothing factor numerator (alpha = SMOOTH_NUM / SMOOTH_DEN)
-/// Higher value = less smoothing, faster response
-/// Lower value = more smoothing, slower response
-const SMOOTH_NUM: i32 = 3;
-
-/// EMA smoothing factor denominator
-const SMOOTH_DEN: i32 = 8;
-
-/// Maximum output magnitude for MotionPayload fields
-const OUTPUT_MAX: i32 = 100;
-
-/// Half-range of ADC (from center to max/min)
-const HALF_RANGE: i16 = ADC_MID;
 
 /// Channel for sending joystick-derived motion commands to the radio task
 pub static JOYSTICK_MOTION_CHANNEL: Channel<CriticalSectionRawMutex, MotionPayload, 4> =
   Channel::new();
 
-/// Joystick state with smoothing filters
+/// Joystick state with one EMA filter per axis.
 struct JoystickState {
-  /// Smoothed X-axis value (scaled to -100..+100 range)
-  smooth_x: i32,
-  /// Smoothed Y-axis value (scaled to -100..+100 range)
-  smooth_y: i32,
+  filter_x: EmaFilter,
+  filter_y: EmaFilter,
 }
 
 impl JoystickState {
   const fn new() -> Self {
     Self {
-      smooth_x: 0,
-      smooth_y: 0,
+      filter_x: EmaFilter::new(),
+      filter_y: EmaFilter::new(),
     }
   }
 
-  /// Apply EMA smoothing: output = alpha * new_value + (1 - alpha) * old_output
-  /// Uses integer arithmetic to avoid floating point on embedded target.
+  /// Run a fresh ADC sample through the shared DSP pipeline and assemble
+  /// the resulting `MotionPayload`.
+  ///
+  /// Axis convention: right stick X (right = positive) maps to `vy`,
+  /// stick Y (forward = positive) maps to `vx`. `omega` is left at 0;
+  /// rotation is provided by the buttons / right stick instead.
   fn update(&mut self, raw_x: i16, raw_y: i16) -> MotionPayload {
-    // Convert raw ADC (0..1023) to centered value (-511..+512)
-    // X-axis: right=1023 -> +, left=0 -> -
-    let centered_x = raw_x - ADC_MID;
-    // Y-axis: up=1023 -> +, down=0 -> -
-    let centered_y = raw_y - ADC_MID;
+    let smoothed_x = signal::process_axis(raw_x, &mut self.filter_x, DEFAULT_DEAD_ZONE);
+    let smoothed_y = signal::process_axis(raw_y, &mut self.filter_y, DEFAULT_DEAD_ZONE);
 
-    // Apply dead zone
-    let dx = apply_dead_zone(centered_x);
-    let dy = apply_dead_zone(centered_y);
-
-    // Scale to -100..+100 range
-    let scaled_x = scale_to_output(dx);
-    let scaled_y = scale_to_output(dy);
-
-    // Apply EMA smoothing (fixed-point: multiply by SMOOTH_DEN to keep precision)
-    self.smooth_x =
-      (SMOOTH_NUM * scaled_x as i32 + (SMOOTH_DEN - SMOOTH_NUM) * self.smooth_x) / SMOOTH_DEN;
-    self.smooth_y =
-      (SMOOTH_NUM * scaled_y as i32 + (SMOOTH_DEN - SMOOTH_NUM) * self.smooth_y) / SMOOTH_DEN;
-
-    // Clamp final output to valid i8 range
-    let vx = self.smooth_y.clamp(-OUTPUT_MAX, OUTPUT_MAX) as i8;
-    let vy = self.smooth_x.clamp(-OUTPUT_MAX, OUTPUT_MAX) as i8;
-
-    MotionPayload { vx, vy, omega: 0 }
+    MotionPayload {
+      vx: smoothed_y,
+      vy: smoothed_x,
+      omega: 0,
+    }
   }
-}
 
-/// Apply dead zone: values within ±DEAD_ZONE of center are treated as zero.
-/// Values outside the dead zone are remapped to fill the full range smoothly.
-#[inline]
-fn apply_dead_zone(value: i16) -> i16 {
-  if value.abs() <= DEAD_ZONE {
-    return 0;
+  /// Drop the smoothing memory back to zero so the first sample after
+  /// reactivation isn't tainted by stale state.
+  fn reset(&mut self) {
+    self.filter_x.reset();
+    self.filter_y.reset();
   }
-  // Remap: remove dead zone gap so output starts from 0 at the edge of dead zone
-  if value > 0 {
-    value - DEAD_ZONE
-  } else {
-    value + DEAD_ZONE
-  }
-}
-
-/// Scale a dead-zone-adjusted value to the -100..+100 output range.
-/// Input range after dead zone removal: -(HALF_RANGE - DEAD_ZONE)..+(HALF_RANGE - DEAD_ZONE)
-#[inline]
-fn scale_to_output(value: i16) -> i16 {
-  let effective_range = (HALF_RANGE - DEAD_ZONE) as i32;
-  if effective_range == 0 {
-    return 0;
-  }
-  let scaled = (value as i32 * OUTPUT_MAX) / effective_range;
-  scaled.clamp(-OUTPUT_MAX, OUTPUT_MAX) as i16
 }
 
 /// Initialize the SAADC peripheral for joystick reading.
@@ -179,11 +123,25 @@ pub async fn joystick_task(mut saadc: Saadc<'static, 2>) {
     // Process through dead zone + smoothing filter
     let motion = state.update(raw_x, raw_y);
 
-    // Only send if the motion has changed (reduces radio traffic)
-    if motion != prev_motion {
-      trace!("Joystick motion: vx={}, vy={}", motion.vx, motion.vy);
-      JOYSTICK_MOTION_CHANNEL.send(motion).await;
-      prev_motion = motion;
+    // Only publish samples while the joystick is the active velocity
+    // source. When inactive we reset the smoothing state so the next
+    // "first sample" after reactivation is honest, and we don't push
+    // anything so the tilt source isn't overridden.
+    if mode::current() == InputMode::Joystick {
+      if motion != prev_motion {
+        trace!("Joystick motion: vx={}, vy={}", motion.vx, motion.vy);
+        JOYSTICK_MOTION_CHANNEL.send(motion).await;
+        prev_motion = motion;
+      }
+    } else {
+      state.reset();
+      // Sentinel that can never equal a real `MotionPayload`, ensuring
+      // the very next sample after re-activation is forwarded.
+      prev_motion = MotionPayload {
+        vx: i8::MIN,
+        vy: i8::MIN,
+        omega: 0,
+      };
     }
 
     // 50 Hz sampling interval
