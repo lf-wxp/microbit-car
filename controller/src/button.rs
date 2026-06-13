@@ -3,7 +3,7 @@
 //! Reads two edge-connector buttons used to control the rotational
 //! velocity (omega) of the Mecanum-wheel car:
 //!
-//! - C button: P16 (P0.09) -> rotate counter-clockwise (omega negative)
+//! - C button: P16 (P1.02) -> rotate counter-clockwise (omega negative)
 //! - D button: P15 (P0.13) -> rotate clockwise         (omega positive)
 //!
 //! Buttons are wired active-low with the nRF52833 internal pull-up
@@ -62,7 +62,7 @@ pub fn init_mode_switch(pin: Peri<'static, peripherals::P0_17>) -> Input<'static
 
 /// Inputs owned by the button task.
 pub struct ButtonInputs {
-  /// C button (P16 / P0.09) -> CCW rotation
+  /// C button (P16 / P1.02) -> CCW rotation
   pub ccw: Input<'static>,
   /// D button (P15 / P0.13) -> CW rotation
   pub cw: Input<'static>,
@@ -70,12 +70,12 @@ pub struct ButtonInputs {
 
 /// Configure the C/D edge-connector pins as pulled-up digital inputs.
 pub fn init(
-  pin_ccw: Peri<'static, peripherals::P0_09>, // P16 / C button
+  pin_ccw: Peri<'static, peripherals::P1_02>, // P16 / C button
   pin_cw: Peri<'static, peripherals::P0_13>,  // P15 / D button
 ) -> ButtonInputs {
   let ccw = Input::new(pin_ccw, Pull::Up);
   let cw = Input::new(pin_cw, Pull::Up);
-  info!("Buttons initialized (C=P16/P0.09 CCW, D=P15/P0.13 CW)");
+  info!("Buttons initialized (C=P16/P1.02 CCW, D=P15/P0.13 CW)");
   ButtonInputs { ccw, cw }
 }
 

@@ -34,6 +34,7 @@ phone needed.
   - [Controller design](#controller-design)
     - [Input pipelines](#input-pipelines)
     - [Fusion loop](#fusion-loop)
+    - [Status indicator (RGB LEDs)](#status-indicator-rgb-leds)
   - [Car design](#car-design)
   - [Pin map (cheat-sheet)](#pin-map-cheat-sheet)
     - [Controller (micro:bit v2)](#controller-microbit-v2)
@@ -50,9 +51,10 @@ phone needed.
     - [1. Add a new input source on the controller](#1-add-a-new-input-source-on-the-controller)
     - [2. Add a new output / actuator on the car](#2-add-a-new-output--actuator-on-the-car)
     - [3. Add a new message type to the protocol](#3-add-a-new-message-type-to-the-protocol)
-    - [4. Tune the driving feel](#4-tune-the-driving-feel)
-    - [5. Port to a different chassis](#5-port-to-a-different-chassis)
-    - [6. Port to a different MCU](#6-port-to-a-different-mcu)
+    - [4. Add a new RGB indicator](#4-add-a-new-rgb-indicator)
+    - [5. Tune the driving feel](#5-tune-the-driving-feel)
+    - [6. Port to a different chassis](#6-port-to-a-different-chassis)
+    - [7. Port to a different MCU](#7-port-to-a-different-mcu)
   - [Contributing](#contributing)
     - [Workflow](#workflow)
     - [Coding conventions](#coding-conventions)
@@ -99,11 +101,13 @@ microbit-car/
 ├── controller/         # Controller firmware (binary crate)
 │   └── src/
 │       ├── main.rs     # Embassy `main`, spawns input/radio tasks, fusion loop
-│       ├── radio.rs    # 802.15.4 TX/RX task, heartbeats, response handling
+│       ├── radio.rs    # 802.15.4 TX/RX task, heartbeats, link-state machine
 │       ├── joystick.rs # SAADC sampling, dead-zone + EMA smoothing
 │       ├── tilt.rs     # LSM303AGR accelerometer driver, tilt → vx/vy
 │       ├── button.rs   # C/D omega buttons + A mode-toggle button
-│       └── mode.rs     # InputMode arbitration (Joystick ⇄ Tilt) via atomic + Signal
+│       ├── mode.rs     # InputMode arbitration (Joystick ⇄ Tilt) via atomic + Signal
+│       ├── display.rs  # 5×5 LED matrix indicator (motion direction)
+│       └── rgb.rs      # 4× WS2812 status LEDs on P8 (link state on LED0)
 │
 └── car/                # Car firmware (binary crate)
     └── src/
@@ -233,7 +237,7 @@ Defined in [`radio-core/src/lib.rs`](radio-core/src/lib.rs):
 | `MAX_TX_RETRIES`         | `3`            | Best-effort retry for normal commands  |
 | `MAX_EMERGENCY_RETRIES`  | `5`            | Higher reliability for E-Stop          |
 | `HEARTBEAT_INTERVAL_MS`  | `200`          | Controller → car liveness ping         |
-| `HEARTBEAT_TIMEOUT_MS`   | `500`          | Car-side fail-safe (stop on silence)   |
+| `HEARTBEAT_TIMEOUT_MS`   | `600`          | 3× heartbeat interval; fail-safe both ways: car halts after this much radio silence, controller's RGB indicator goes red |
 
 ### Hex examples
 
@@ -315,7 +319,7 @@ Telemetry       seq=0x42
 
 ## Controller design
 
-The controller spawns five Embassy tasks plus the main fusion loop:
+The controller spawns six Embassy tasks plus the main fusion loop:
 
 | Task              | File           | Output                                         |
 |-------------------|----------------|------------------------------------------------|
@@ -323,7 +327,8 @@ The controller spawns five Embassy tasks plus the main fusion loop:
 | `tilt_task`       | `tilt.rs`      | `TILT_MOTION_CHANNEL`     (vx, vy)             |
 | `button_task`     | `button.rs`    | `OMEGA_CHANNEL`            (omega)             |
 | `mode_switch_task`| `button.rs`    | `mode::set()` + `MODE_CHANGED` signal          |
-| `radio_task`      | `radio.rs`     | `MOTION_TX_CHANNEL` consumer; sends packets    |
+| `radio_task`      | `radio.rs`     | `MOTION_TX_CHANNEL` consumer; sends packets, also publishes link state on `RGB_STATE` |
+| `rgb_task`        | `rgb.rs`       | Renders four WS2812 LEDs from latest `RGB_STATE` |
 
 ### Input pipelines
 
@@ -355,6 +360,34 @@ The controller spawns five Embassy tasks plus the main fusion loop:
 heartbeat timer / mode-changed signal, and re-emits the latest combined
 `MotionPayload` to the radio task. This guarantees the car always
 receives a fresh command (or `0,0,0` once you let go), never a stale one.
+
+### Status indicator (RGB LEDs)
+
+The controller's extension board carries **four daisy-chained WS2812
+LEDs** wired to a single data line on edge-connector **P8** (= `P0_10`).
+They are driven by the nRF52833's `PWM0` peripheral with EasyDMA, so
+the strict 800 kHz / ±150 ns WS2812 timing is met without CPU
+bit-banging:
+
+- PWM base clock 16 MHz, `max_duty = 20` ⇒ one period is exactly
+  1.25 µs (= one WS2812 bit slot).
+- `T0H = 5 / 20` (≈ 0.31 µs), `T1H = 13 / 20` (≈ 0.81 µs) — both safely
+  inside the datasheet windows.
+- After every frame the line is held low for ≥ 80 µs to latch.
+
+**Today only LED0 is rendered**, mirroring the radio link state:
+
+| State          | LED0 colour      | Meaning                                                       |
+|----------------|------------------|---------------------------------------------------------------|
+| `Connecting`   | breathing amber  | Radio is up but the car hasn't replied yet                    |
+| `Connected`    | dim green        | A heartbeat reply was received within the last `HEARTBEAT_TIMEOUT_MS` |
+| `Disconnected` | dim red          | No heartbeat reply for `HEARTBEAT_TIMEOUT_MS` (= 600 ms)      |
+
+LEDs 1–3 are kept blank but the driver always shifts out all four
+pixels (WS2812 is a single-wire daisy chain — there's no way to address
+only the first one). Adding a new indicator is therefore a pure
+render-side change: extend [`RgbState`](controller/src/rgb.rs) and the
+`render` function, and the driver itself doesn't need to know.
 
 ---
 
@@ -400,8 +433,9 @@ loop {
 | Right joystick Y (reserved)    | _TBD_          | `_TBD_` (AINx)| SAADC, feature `right-stick-hw` |
 | Shield button **A** (mode tgl) | **P13**        | `P0.17`       | Input, `Pull::Up`   |
 | Shield button **B** (reserved) | **P14**        | `P0.01`       | (unused)            |
-| Shield button **C** (omega CCW)| **P16**        | `P0.09`       | Input, `Pull::Up`   |
+| Shield button **C** (omega CCW)| **P16**        | `P1.02`       | Input, `Pull::Up`   |
 | Shield button **D** (omega CW )| **P15**        | `P0.13`       | Input, `Pull::Up`   |
+| Shield RGB LED chain (×4)      | **P8**         | `P0.10`       | PWM0 / EasyDMA, WS2812 800 kHz |
 | Accelerometer SCL              | internal       | `P0.08`       | TWIM @ 100 kHz      |
 | Accelerometer SDA              | internal       | `P0.16`       | TWIM @ 100 kHz      |
 | Status LED (top-left of grid)  | row1/col1      | `P0.21`/`P0.28`| GPIO output        |
@@ -491,8 +525,11 @@ cargo make clean              # cargo clean
 
 1. Power up the **car** (battery on the MotorBit shield).
 2. Power up the **controller** (USB power bank or coin-cell pack).
-3. Wait ~1 second for both radios to come up — the top-left LED on each
-   board lights up once it sees activity.
+3. Watch the **first RGB LED** on the controller's extension board
+   (LED0, on edge-connector P8). It boots up showing a **breathing
+   amber** "connecting" pulse, turns **dim green** as soon as the car
+   replies to the first heartbeat (typically within ~200 ms), and goes
+   **dim red** if the link drops for more than 600 ms.
 4. Default mode is **Joystick**:
    - Push the stick **forward / back** → car drives forward / backward.
    - Push **left / right** → car strafes sideways.
@@ -513,8 +550,10 @@ cargo make clean              # cargo clean
    to ±100**, so the buttons act as fine trim on top of the stick.
 8. Letting go of all inputs immediately sends `(0, 0, 0)`; the car halts.
 9. The car also halts on its own if it stops hearing from the controller
-   for `HEARTBEAT_TIMEOUT_MS` (500 ms by default — set in
-   `radio-core`).
+   for `HEARTBEAT_TIMEOUT_MS` (600 ms by default — set in
+   `radio-core` as `3 × HEARTBEAT_INTERVAL_MS`). When that happens, the
+   controller's RGB indicator turns red, so you get a visual cue that
+   the link is gone before you wonder why the car stopped responding.
 
 ---
 
@@ -548,6 +587,9 @@ cargo make clean              # cargo clean
 | `cargo build` fails with **"target 'thumbv7em-none-eabihf' not found"** | Cross-compile target missing                                                                  | `rustup target add thumbv7em-none-eabihf`                                                                                            |
 | `cargo install probe-rs` fails on macOS                                | `libusb` / `libudev` headers missing                                                          | `brew install libusb pkg-config`                                                                                                     |
 | Controller works but tilt mode never engages                           | Shield button A wiring or `Pull::Up` mismatch                                                 | Check P13 with a multimeter; the line should be high at idle, low when pressed                                                       |
+| RGB LED on the controller never lights up                              | P8 not bonded to `P0.10`, or LEDs powered from 3.3 V on a strip that needs 5 V                | Verify the shield's silkscreen says P8 = data; if so, give the chain a clean 5 V (or ≥ 4.5 V) supply and a common ground             |
+| RGB LED is on but **colours look wrong** (e.g. "green" shows red)       | Clone WS2812 chips with non-standard byte order (RGB / BGR instead of GRB)                    | Swap the byte order in `encode_pixels` in [`controller/src/rgb.rs`](controller/src/rgb.rs)                                            |
+| Controller's LED stays **amber forever**                               | Car firmware not running, on a different `RADIO_CHANNEL`, or out of range                     | Re-flash the car, verify both boards came from the same checkout, move them closer                                                  |
 
 ---
 
@@ -606,7 +648,35 @@ For example a servo-driven gripper or pan-tilt camera.
    forward the parsed payload to its consumer over a new
    `embassy_sync` channel.
 
-### 4. Tune the driving feel
+### 4. Add a new RGB indicator
+
+The four-LED chain on P8 is wired up but only LED0 is currently used
+(for radio link state). To repurpose one of the spare LEDs — for
+example to show the active input mode, the sign of `omega`, or a
+battery warning:
+
+1. Open [`controller/src/rgb.rs`](controller/src/rgb.rs) and add a new
+   field to `RgbState` (e.g. `pub mode: InputMode`). Update the
+   `INITIAL` constant accordingly.
+2. Extend the `render` function so the new field maps to one of
+   `frame[1]`, `frame[2]` or `frame[3]`. Keep the existing `frame[0]`
+   mapping for the link state untouched.
+3. From whichever task owns the new piece of information, publish a
+   refreshed `RgbState` via `RGB_STATE.signal(...)`. The pattern in
+   `controller/src/radio.rs::publish_link_state` is the canonical
+   example — keep one task as the writer per field so updates remain
+   serialised.
+4. No changes are needed in `main.rs`, the protocol, or the car: the
+   driver task picks up the latest `RgbState` automatically and
+   re-renders within ~60 ms.
+
+Because WS2812 is a single-wire daisy chain, the driver always emits
+all four pixels regardless of how many you actually drive — there's no
+per-LED "on/off" cost to worry about, just keep the brightness low
+(target `value ≤ 20 / 255`) so the indicators stay comfortable to
+look at from close range.
+
+### 5. Tune the driving feel
 
 | Knob                                    | File                          | Effect                                  |
 |-----------------------------------------|-------------------------------|-----------------------------------------|
@@ -618,7 +688,7 @@ For example a servo-driven gripper or pan-tilt camera.
 | `RADIO_CHANNEL` / `TX_POWER`            | `radio-core/src/lib.rs`       | RF coexistence & range                  |
 | `HEARTBEAT_TIMEOUT_MS`                  | `radio-core/src/lib.rs`       | How long the car coasts after RF loss   |
 
-### 5. Port to a different chassis
+### 6. Port to a different chassis
 
 The whole car-side abstraction stack is `MotorDriver → MotorBit → PCA9685`.
 - For a **non-Mecanum** drivetrain (differential / Ackermann), keep
@@ -629,7 +699,7 @@ The whole car-side abstraction stack is `MotorDriver → MotorBit → PCA9685`.
   the rest as-is. As long as the new driver consumes `MotionPayload`,
   the controller and the radio stack don’t need to change at all.
 
-### 6. Port to a different MCU
+### 7. Port to a different MCU
 
 `embassy-nrf` is the only nRF-specific dependency on the firmware side,
 and it’s isolated to `radio-core`, `tilt.rs`, `joystick.rs`,
@@ -779,6 +849,8 @@ Open an issue with:
   hackable platform with a built-in radio.
 - Yahboom / ELECFREAKS-style **MotorBit** vendors for the PCA9685-based
   shield that makes Mecanum-wheel projects approachable.
+- **WorldSemi WS2812** for the ubiquitous one-wire RGB pixel that turns
+  any spare GPIO into a status display.
 
 [BBC micro:bit]: https://microbit.org/
 

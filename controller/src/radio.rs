@@ -7,7 +7,7 @@ use embassy_nrf::radio::ieee802154::{Packet, Radio};
 use embassy_nrf::{Peri, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use defmt::{error, info, trace};
 use protocol::{
@@ -19,6 +19,13 @@ use radio_core::{
   send_packet_with_retries,
 };
 
+use crate::rgb::{ConnectionState, RGB_STATE, RgbState};
+
+/// Time without a heartbeat reply after which we declare the link
+/// down. Sized to a small multiple of `HEARTBEAT_INTERVAL_MS` so a
+/// single missed packet doesn't flicker the indicator red.
+pub const HEARTBEAT_TIMEOUT_MS: u64 = HEARTBEAT_INTERVAL_MS * 3;
+
 /// Channel for sending motion commands from main logic to radio TX task
 pub static MOTION_TX_CHANNEL: Channel<CriticalSectionRawMutex, MotionPayload, 4> = Channel::new();
 
@@ -29,8 +36,10 @@ pub static RESPONSE_CHANNEL: Channel<CriticalSectionRawMutex, ResponsePayload, 2
 pub static TELEMETRY_RX_CHANNEL: Channel<CriticalSectionRawMutex, TelemetryPayload, 2> =
   Channel::new();
 
-/// Connection status: true if heartbeat response received recently
-pub static CONNECTION_STATUS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
+/// Channel carrying every received heartbeat response from the car.
+/// `radio_task` consumes this internally to refresh the link timer
+/// and publish a [`ConnectionState`] update on [`RGB_STATE`].
+static HEARTBEAT_RX: Channel<CriticalSectionRawMutex, (), 4> = Channel::new();
 
 /// Initialize the radio peripheral for the controller
 pub fn init(radio_periph: Peri<'static, peripherals::RADIO>) -> Radio<'static> {
@@ -40,7 +49,9 @@ pub fn init(radio_periph: Peri<'static, peripherals::RADIO>) -> Radio<'static> {
 /// Radio task: handles both TX (sending commands) and RX (receiving responses).
 ///
 /// This task alternates between sending pending commands and listening for
-/// responses from the car. It also sends periodic heartbeats.
+/// responses from the car. It also sends periodic heartbeats and keeps
+/// the [`RGB_STATE`] link indicator in sync with how recently the car
+/// last replied.
 #[embassy_executor::task]
 pub async fn radio_task(mut radio: Radio<'static>) {
   info!("Controller radio task started");
@@ -48,6 +59,13 @@ pub async fn radio_task(mut radio: Radio<'static>) {
   let mut seq: u8 = 0;
   let mut heartbeat_timer = 0u64;
   let mut rx_packet = Packet::new();
+
+  // Link-state bookkeeping. We publish `Connecting` upfront so the LED
+  // doesn't sit in its power-on state while we wait for the first
+  // heartbeat round-trip.
+  let mut link_state = ConnectionState::Connecting;
+  let mut last_heartbeat: Option<Instant> = None;
+  publish_link_state(link_state);
 
   loop {
     // Check if there's a motion command to send
@@ -62,6 +80,20 @@ pub async fn radio_task(mut radio: Radio<'static>) {
       heartbeat_timer = 0;
       let hb = create_heartbeat_packet(next_seq(&mut seq));
       send_packet(&mut radio, &hb).await;
+    }
+
+    // Drain any heartbeat-reply notifications produced by the RX path.
+    // Each one bumps `last_heartbeat` forward.
+    while HEARTBEAT_RX.try_receive().is_ok() {
+      last_heartbeat = Some(Instant::now());
+    }
+
+    // Re-evaluate link state every loop tick.
+    let next_state = derive_link_state(last_heartbeat);
+    if next_state != link_state {
+      info!("Radio link: {:?} -> {:?}", link_state, next_state);
+      link_state = next_state;
+      publish_link_state(link_state);
     }
 
     // Try to receive a response (with short timeout)
@@ -91,6 +123,25 @@ pub async fn radio_task(mut radio: Radio<'static>) {
   }
 }
 
+/// Decide the current link state from the timestamp of the most
+/// recent heartbeat reply.
+fn derive_link_state(last_heartbeat: Option<Instant>) -> ConnectionState {
+  let Some(last) = last_heartbeat else {
+    return ConnectionState::Connecting;
+  };
+  if last.elapsed() <= Duration::from_millis(HEARTBEAT_TIMEOUT_MS) {
+    ConnectionState::Connected
+  } else {
+    ConnectionState::Disconnected
+  }
+}
+
+/// Push the latest link state into the shared RGB signal so the LED
+/// driver re-renders.
+fn publish_link_state(connection: ConnectionState) {
+  RGB_STATE.signal(RgbState { connection });
+}
+
 /// Handle a received packet from the car
 fn handle_received_packet(packet: &RadioPacket) {
   match packet.header.msg_type {
@@ -114,7 +165,8 @@ fn handle_received_packet(packet: &RadioPacket) {
     }
     MessageType::Heartbeat => {
       trace!("Heartbeat response received");
-      let _ = CONNECTION_STATUS.try_send(true);
+      // Notify the radio task; it owns the link-state machine.
+      let _ = HEARTBEAT_RX.try_send(());
     }
     MessageType::Motion | MessageType::EmergencyStop => {
       // Controller should not receive these types, ignore

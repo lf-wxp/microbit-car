@@ -8,7 +8,7 @@
 //! [`crate::signal`] so the right-stick driver can reuse the same maths.
 
 use embassy_nrf::bind_interrupts;
-use embassy_nrf::saadc::{ChannelConfig, Config, InterruptHandler, Saadc};
+use embassy_nrf::saadc::{ChannelConfig, Config, InterruptHandler, Resolution, Saadc};
 use embassy_nrf::{Peri, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -81,7 +81,13 @@ pub fn init<'d>(
   pin_y: Peri<'d, peripherals::P0_03>, // P1 = AIN2 on micro:bit edge connector
   pin_x: Peri<'d, peripherals::P0_04>, // P2 = AIN3 on micro:bit edge connector
 ) -> Saadc<'d, 2> {
-  let config = Config::default();
+  // The shared DSP pipeline (`signal::process_axis`) assumes 10-bit
+  // samples (0..=1023). embassy-nrf defaults to 12-bit, which would make
+  // the idle reading land near 1877 and `clamp(0, ADC_MAX=1023)` would
+  // saturate the entire right/up half-range. Pin the resolution so the
+  // hardware matches the DSP assumption.
+  let mut config = Config::default();
+  config.resolution = Resolution::_10BIT;
 
   // Channel 0: Y-axis (P1 / AIN2)
   let channel_y = ChannelConfig::single_ended(pin_y);
@@ -90,7 +96,7 @@ pub fn init<'d>(
 
   let saadc = Saadc::new(saadc_periph, Irqs, config, [channel_y, channel_x]);
 
-  info!("Joystick SAADC initialized (Y=P1/AIN2, X=P2/AIN3)");
+  info!("Joystick SAADC initialized (Y=P1/AIN2, X=P2/AIN3, 10-bit)");
   saadc
 }
 

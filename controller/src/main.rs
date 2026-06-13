@@ -7,6 +7,7 @@ mod joystick;
 mod joystick_right;
 mod mode;
 mod radio;
+mod rgb;
 mod signal;
 mod tilt;
 
@@ -86,14 +87,22 @@ async fn main(spawner: Spawner) {
   spawner.spawn(tilt::tilt_task(twim).unwrap());
 
   // Initialize C/D buttons (omega control) and spawn button task.
-  // C button = P16 (P0.09) -> CCW, D button = P15 (P0.13) -> CW.
-  let buttons = button::init(p.P0_09, p.P0_13);
+  // C button = P16 (P1.02) -> CCW, D button = P15 (P0.13) -> CW.
+  let buttons = button::init(p.P1_02, p.P0_13);
   spawner.spawn(button::button_task(buttons).unwrap());
 
   // Initialize the extension-board A button (edge-connector P13 = P0.17)
   // as the input-mode toggle. B (P14/P0.01) is reserved for future use.
   let mode_button = button::init_mode_switch(p.P0_17);
   spawner.spawn(button::mode_switch_task(mode_button).unwrap());
+
+  // Initialize the extension-board's WS2812 status LEDs (4 in a daisy
+  // chain on edge-connector P8 = P0_10) and spawn the indicator task.
+  // Today only LED0 is rendered, showing the radio link state; the
+  // other three are reserved for future indicators (input mode,
+  // omega direction, motion magnitude, ...).
+  let ws2812 = rgb::Ws2812::new(p.PWM0, p.P0_10);
+  spawner.spawn(rgb::rgb_task(ws2812).unwrap());
 
   info!("All input tasks spawned, entering fusion loop (default mode = Joystick)");
 

@@ -88,7 +88,7 @@ mod source {
   //! Real SAADC-backed implementation. Finalize the pin assignment when
   //! the second stick lands on the board and remove the `todo!()`s.
 
-  use embassy_nrf::saadc::{self, ChannelConfig, Config, Saadc};
+  use embassy_nrf::saadc::{self, ChannelConfig, Config, Resolution, Saadc};
   use embassy_nrf::{Peri, peripherals};
 
   use super::signal::ADC_MAX;
@@ -132,9 +132,14 @@ mod source {
       #[allow(unreachable_code)]
       {
         let _: Saadc<'static, 2> = {
+          // Match the left-stick configuration: pin SAADC at 10-bit so
+          // the shared `signal::process_axis` pipeline (which assumes
+          // 0..=1023) sees raw samples in the expected range.
+          let mut config = Config::default();
+          config.resolution = Resolution::_10BIT;
           let cfg_x = ChannelConfig::single_ended(pin_x);
           let cfg_y = ChannelConfig::single_ended(pin_y);
-          Saadc::new(saadc_periph, Irqs, Config::default(), [cfg_x, cfg_y])
+          Saadc::new(saadc_periph, Irqs, config, [cfg_x, cfg_y])
         };
         todo!("Wire the right-stick SAADC channels once the hardware lands");
       }
