@@ -3,11 +3,12 @@
 //! Uses IEEE 802.15.4 (2.4 GHz) radio on nRF52833 to send motion commands
 //! to the car and receive response/telemetry data back.
 
+use embassy_futures::select::{Either4, select4};
 use embassy_nrf::radio::ieee802154::{Packet, Radio};
 use embassy_nrf::{Peri, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Ticker};
 
 use defmt::{error, info, trace};
 use protocol::{
@@ -25,6 +26,11 @@ use crate::rgb::{ConnectionState, RGB_STATE, RgbState};
 /// down. Sized to a small multiple of `HEARTBEAT_INTERVAL_MS` so a
 /// single missed packet doesn't flicker the indicator red.
 pub const HEARTBEAT_TIMEOUT_MS: u64 = HEARTBEAT_INTERVAL_MS * 3;
+
+/// How often to re-evaluate the link state from `last_heartbeat`.
+/// Faster than the heartbeat interval so a missed reply transitions
+/// the LED with sub-second latency.
+const LINK_EVAL_INTERVAL_MS: u64 = 200;
 
 /// Channel for sending motion commands from main logic to radio TX task
 pub static MOTION_TX_CHANNEL: Channel<CriticalSectionRawMutex, MotionPayload, 4> = Channel::new();
@@ -48,16 +54,28 @@ pub fn init(radio_periph: Peri<'static, peripherals::RADIO>) -> Radio<'static> {
 
 /// Radio task: handles both TX (sending commands) and RX (receiving responses).
 ///
-/// This task alternates between sending pending commands and listening for
-/// responses from the car. It also sends periodic heartbeats and keeps
-/// the [`RGB_STATE`] link indicator in sync with how recently the car
-/// last replied.
+/// Steady state is `radio.receive()` — we want the controller to
+/// look exactly like the car from the link's perspective, since
+/// the car responds within 1–3 ms of receiving a motion frame and
+/// the previous design (alternating short TX bursts with a 10 ms
+/// RX window) systematically missed those replies.
+///
+/// `select4` lets four asynchronous events preempt the receive
+/// future:
+///   * a queued outbound motion packet,
+///   * the periodic heartbeat tick,
+///   * the link-state evaluation tick,
+///   * a completed inbound packet.
+///
+/// Whenever we leave the `radio.receive()` arm to do anything
+/// else, the future is dropped and embassy-nrf's `OnDrop` cleanup
+/// resets the RADIO state machine, so the next loop iteration
+/// re-enters RX cleanly.
 #[embassy_executor::task]
 pub async fn radio_task(mut radio: Radio<'static>) {
   info!("Controller radio task started");
 
   let mut seq: u8 = 0;
-  let mut heartbeat_timer = 0u64;
   let mut rx_packet = Packet::new();
 
   // Link-state bookkeeping. We publish `Connecting` upfront so the LED
@@ -67,57 +85,60 @@ pub async fn radio_task(mut radio: Radio<'static>) {
   let mut last_heartbeat: Option<Instant> = None;
   publish_link_state(link_state);
 
+  let mut heartbeat_ticker = Ticker::every(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+  let mut link_eval_ticker = Ticker::every(Duration::from_millis(LINK_EVAL_INTERVAL_MS));
+
   loop {
-    // Check if there's a motion command to send
-    if let Ok(motion) = MOTION_TX_CHANNEL.try_receive() {
-      let packet = create_motion_packet(next_seq(&mut seq), motion.vx, motion.vy, motion.omega);
-      send_packet(&mut radio, &packet).await;
-    }
+    // Default await: every branch except the receive completion
+    // requires us to drop `recv_fut` and run a short TX path or
+    // bookkeeping step before returning to RX.
+    let recv_fut = radio.receive(&mut rx_packet);
+    let motion_fut = MOTION_TX_CHANNEL.receive();
+    let hb_fut = heartbeat_ticker.next();
+    let link_fut = link_eval_ticker.next();
 
-    // Send periodic heartbeat
-    heartbeat_timer += 10;
-    if heartbeat_timer >= HEARTBEAT_INTERVAL_MS {
-      heartbeat_timer = 0;
-      let hb = create_heartbeat_packet(next_seq(&mut seq));
-      send_packet(&mut radio, &hb).await;
-    }
-
-    // Drain any heartbeat-reply notifications produced by the RX path.
-    // Each one bumps `last_heartbeat` forward.
-    while HEARTBEAT_RX.try_receive().is_ok() {
-      last_heartbeat = Some(Instant::now());
-    }
-
-    // Re-evaluate link state every loop tick.
-    let next_state = derive_link_state(last_heartbeat);
-    if next_state != link_state {
-      info!("Radio link: {:?} -> {:?}", link_state, next_state);
-      link_state = next_state;
-      publish_link_state(link_state);
-    }
-
-    // Try to receive a response (with short timeout)
-    match embassy_futures::select::select(
-      radio.receive(&mut rx_packet),
-      Timer::after(Duration::from_millis(10)),
-    )
-    .await
-    {
-      embassy_futures::select::Either::First(result) => match result {
+    match select4(recv_fut, motion_fut, hb_fut, link_fut).await {
+      Either4::First(result) => match result {
         Ok(()) => {
           let data: &[u8] = &rx_packet;
-          if !data.is_empty()
-            && let Some(packet) = RadioPacket::from_bytes(data)
-          {
-            handle_received_packet(&packet);
+          if !data.is_empty() {
+            if let Some(packet) = RadioPacket::from_bytes(data) {
+              trace!(
+                "RX packet: type={:?}, len={}",
+                packet.header.msg_type,
+                data.len()
+              );
+              handle_received_packet(&packet);
+            } else {
+              trace!("RX parse failed (len={})", data.len());
+            }
           }
         }
         Err(e) => {
           trace!("RX error: {:?}", e);
         }
       },
-      embassy_futures::select::Either::Second(_) => {
-        // Timeout, no packet received - continue loop
+      Either4::Second(motion) => {
+        let packet = create_motion_packet(next_seq(&mut seq), motion.vx, motion.vy, motion.omega);
+        send_packet(&mut radio, &packet).await;
+      }
+      Either4::Third(_) => {
+        let hb = create_heartbeat_packet(next_seq(&mut seq));
+        send_packet(&mut radio, &hb).await;
+      }
+      Either4::Fourth(_) => {
+        // Drain any heartbeat-reply notifications produced by the
+        // RX path so a fresh `last_heartbeat` lands before we
+        // recompute the link state.
+        while HEARTBEAT_RX.try_receive().is_ok() {
+          last_heartbeat = Some(Instant::now());
+        }
+        let next_state = derive_link_state(last_heartbeat);
+        if next_state != link_state {
+          info!("Radio link: {:?} -> {:?}", link_state, next_state);
+          link_state = next_state;
+          publish_link_state(link_state);
+        }
       }
     }
   }

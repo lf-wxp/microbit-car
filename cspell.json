@@ -12,6 +12,7 @@
 		"datawhiteiv",
 		"defmt",
 		"eabihf",
+		"framestart",
 		"gipote",
 		"GPIOTE",
 		"heapless",
@@ -49,7 +50,9 @@
 		"txaddress",
 		"txen",
 		"txpower",
+		"UNINIT",
 		"whiteen",
-		"wukong"
+		"wukong",
+		"Xtal"
 	]
 }

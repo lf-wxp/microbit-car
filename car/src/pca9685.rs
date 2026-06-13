@@ -10,6 +10,21 @@
 //! - Per-channel ON/OFF timing control (0-4095)
 //! - Convenient duty setting (ON=0, OFF=duty)
 //!
+//! # Default carrier frequency
+//!
+//! On power-up the driver picks [`DEFAULT_PWM_FREQ_HZ`] (currently
+//! 1500 Hz) instead of the more common 50 Hz hobby-servo default.
+//! At 50 Hz the H-bridge / motor inductance resonates audibly and
+//! sounds exactly like a stuck buzzer; pushing the carrier above
+//! ~1 kHz moves the audible component out of the most sensitive band
+//! of human hearing. PCA9685's hardware ceiling is ~1526 Hz, so 1500
+//! is the practical sweet spot for DC-motor-only setups.
+//!
+//! Note that the chip uses a single shared frequency for **all** 16
+//! channels, so this default is incompatible with RC hobby servos
+//! (which need 50 Hz). Switch back to 50 Hz with
+//! [`Pca9685::set_frequency_hz`] if you need to drive servos.
+//!
 //! # Register Layout
 //!
 //! ```text
@@ -28,41 +43,30 @@ use defmt::{info, warn};
 /// MODE1 register
 pub const REG_MODE1: u8 = 0x00;
 /// MODE2 register
-#[allow(dead_code)]
 pub const REG_MODE2: u8 = 0x01;
 /// Sub-address 1
-#[allow(dead_code)]
 pub const REG_SUBADR1: u8 = 0x02;
 /// Sub-address 2
-#[allow(dead_code)]
 pub const REG_SUBADR2: u8 = 0x03;
 /// Sub-address 3
-#[allow(dead_code)]
 pub const REG_SUBADR3: u8 = 0x04;
 /// Prescaler register (writable only in sleep mode)
 pub const REG_PRESCALE: u8 = 0xFE;
 /// Channel 0 ON low byte
 pub const REG_LED0_ON_L: u8 = 0x06;
 /// Channel 0 ON high byte
-#[allow(dead_code)]
 pub const REG_LED0_ON_H: u8 = 0x07;
 /// Channel 0 OFF low byte
-#[allow(dead_code)]
 pub const REG_LED0_OFF_L: u8 = 0x08;
 /// Channel 0 OFF high byte
-#[allow(dead_code)]
 pub const REG_LED0_OFF_H: u8 = 0x09;
 /// All channels ON low byte
-#[allow(dead_code)]
 pub const REG_ALL_LED_ON_L: u8 = 0xFA;
 /// All channels ON high byte
-#[allow(dead_code)]
 pub const REG_ALL_LED_ON_H: u8 = 0xFB;
 /// All channels OFF low byte
-#[allow(dead_code)]
 pub const REG_ALL_LED_OFF_L: u8 = 0xFC;
 /// All channels OFF high byte
-#[allow(dead_code)]
 pub const REG_ALL_LED_OFF_H: u8 = 0xFD;
 
 // --- MODE1 Register Bits ---
@@ -79,52 +83,36 @@ const MODE1_RESTART: u8 = 0x80;
 // --- PWM Output Channel Numbers (CH0~CH15) ---
 
 /// PWM channel 0
-#[allow(dead_code)]
 pub const CH0: u8 = 0;
 /// PWM channel 1
-#[allow(dead_code)]
 pub const CH1: u8 = 1;
 /// PWM channel 2
-#[allow(dead_code)]
 pub const CH2: u8 = 2;
 /// PWM channel 3
-#[allow(dead_code)]
 pub const CH3: u8 = 3;
 /// PWM channel 4
-#[allow(dead_code)]
 pub const CH4: u8 = 4;
 /// PWM channel 5
-#[allow(dead_code)]
 pub const CH5: u8 = 5;
 /// PWM channel 6
-#[allow(dead_code)]
 pub const CH6: u8 = 6;
 /// PWM channel 7
-#[allow(dead_code)]
 pub const CH7: u8 = 7;
 /// PWM channel 8
-#[allow(dead_code)]
 pub const CH8: u8 = 8;
 /// PWM channel 9
-#[allow(dead_code)]
 pub const CH9: u8 = 9;
 /// PWM channel 10
-#[allow(dead_code)]
 pub const CH10: u8 = 10;
 /// PWM channel 11
-#[allow(dead_code)]
 pub const CH11: u8 = 11;
 /// PWM channel 12
-#[allow(dead_code)]
 pub const CH12: u8 = 12;
 /// PWM channel 13
-#[allow(dead_code)]
 pub const CH13: u8 = 13;
 /// PWM channel 14
-#[allow(dead_code)]
 pub const CH14: u8 = 14;
 /// PWM channel 15
-#[allow(dead_code)]
 pub const CH15: u8 = 15;
 
 /// Total number of channels
@@ -138,6 +126,14 @@ const DEFAULT_ADDR: u8 = 0x40;
 
 /// PCA9685 internal oscillator frequency (25MHz)
 const OSCILLATOR_FREQ: u32 = 25_000_000;
+
+/// Default PWM carrier frequency for DC-motor use (Hz).
+///
+/// At ~1500 Hz the PCA9685 is at its hardware ceiling
+/// (`25 MHz / 4096 / 4 ≈ 1525 Hz`), well above the audible "buzz"
+/// band of the H-bridge + motor coil resonance. See the long-form
+/// rationale in [`Pca9685::with_address`].
+pub const DEFAULT_PWM_FREQ_HZ: u16 = 1500;
 
 /// PCA9685 driver struct
 ///
@@ -153,7 +149,7 @@ impl<'a> Pca9685<'a> {
   ///
   /// Initialization sequence matches pca9685.py `__init__`:
   /// 1. Write MODE1 = 0x00 to reset
-  /// 2. Set frequency to 50Hz
+  /// 2. Set frequency to [`DEFAULT_PWM_FREQ_HZ`]
   /// 3. Clear all 16 channels' duty to 0
   pub async fn new(twim: &'a mut Twim<'static>) -> Self {
     Self::with_address(twim, DEFAULT_ADDR).await
@@ -172,7 +168,10 @@ impl<'a> Pca9685<'a> {
     Self {
       twim,
       addr,
-      frequency_hz: 50, // Assume already initialized to 50Hz
+      // Must match the value used in `with_address` so that downstream
+      // duty calculations (e.g. servo angle conversion) stay consistent
+      // when callers pick up an already-initialized chip.
+      frequency_hz: DEFAULT_PWM_FREQ_HZ,
     }
   }
 
@@ -187,15 +186,34 @@ impl<'a> Pca9685<'a> {
     driver.write_reg(REG_MODE1, 0x00).await;
     Timer::after(Duration::from_millis(5)).await;
 
-    // Set default frequency to 50Hz
-    driver.set_frequency_hz(50).await;
+    // Set default frequency to ~1500 Hz, the upper limit of PCA9685.
+    //
+    // Why not the original 50 Hz? At 50 Hz the H-bridge / motor inductance
+    // resonates audibly (the 50 Hz fundamental and its odd harmonics fall
+    // inside the most sensitive part of human hearing, ~150-500 Hz),
+    // producing a continuous chirp that sounds like a stuck buzzer.
+    // Pushing the carrier above ~1 kHz moves the audible component out
+    // of the high-sensitivity band; 1500 Hz is the chip's hard ceiling
+    // (25 MHz / 4096 / (prescaler+1), with prescaler_min = 3).
+    //
+    // CAVEAT: PCA9685 uses one shared frequency for all 16 channels. RC
+    // hobby servos require a 50 Hz / 20 ms frame, so this default is
+    // incompatible with the MotorBit servo headers (S1-S8). This robot
+    // only drives DC motors via the M1-M4 H-bridge, where any frequency
+    // in the kHz range works fine, so we trade servo support for silent
+    // operation. If servos are needed later, expose `set_frequency_hz`
+    // and call it with 50 before driving them.
+    driver.set_frequency_hz(DEFAULT_PWM_FREQ_HZ).await;
 
     // Clear all channels' duty
     for ch in 0..NUM_CHANNELS {
       driver.duty(ch, 0).await;
     }
 
-    info!("PCA9685 initialized: addr=0x{:02X}, freq=50Hz", addr);
+    info!(
+      "PCA9685 initialized: addr=0x{:02X}, freq={}Hz",
+      addr, DEFAULT_PWM_FREQ_HZ
+    );
     driver
   }
 
@@ -279,6 +297,38 @@ impl<'a> Pca9685<'a> {
   /// - `value`: Duty cycle (0-4095)
   pub async fn duty(&mut self, channel: u8, value: u16) {
     self.pwm(channel, 0, value.min(PWM_MAX)).await;
+  }
+
+  /// Force a channel into "full OFF" state (datasheet section 7.3.3).
+  ///
+  /// Setting bit 4 of the `LEDx_OFF_H` register puts the output into
+  /// **always-low** mode, bypassing the PWM modulator entirely. This is
+  /// fundamentally different from writing `duty(0)`: a 0% duty cycle still
+  /// makes the modulator perform an internal compare every PWM period,
+  /// which on some H-bridges (TB6612 and friends) leaks audible switching
+  /// noise into the motor coils. Full-OFF cuts the modulator completely,
+  /// driving the output to a clean DC ground level.
+  ///
+  /// We use this whenever a DC motor is commanded to stop, so the chassis
+  /// is silent when standing still even with a kHz-range PWM carrier.
+  ///
+  /// Per the datasheet, `LEDx_OFF_H` bit 4 has priority over `LEDx_ON_H`
+  /// bit 4, so we only need to write the OFF register. Writing all four
+  /// bytes anyway (with the FULL_OFF bit set in OFF_H) keeps the register
+  /// pair internally consistent and matches the auto-increment write
+  /// pattern used elsewhere.
+  pub async fn set_full_off(&mut self, channel: u8) {
+    debug_assert!(channel < NUM_CHANNELS, "channel out of range (0-15)");
+
+    let reg_base = (channel << 2) + REG_LED0_ON_L;
+
+    // ON  = 0x0000
+    // OFF_L = 0x00, OFF_H = 0b0001_0000 (FULL_OFF bit)
+    let buf: [u8; 5] = [reg_base, 0x00, 0x00, 0x00, 0x10];
+
+    if self.twim.write(self.addr, &buf).await.is_err() {
+      warn!("PCA9685: I2C write failed for FULL_OFF channel {}", channel);
+    }
   }
 
   /// Read a single register

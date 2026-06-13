@@ -16,6 +16,7 @@ use panic_probe as _;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either4, select, select4};
+use embassy_nrf::config::{Config, HfclkSource};
 use embassy_time::{Duration, Timer};
 
 use defmt::info;
@@ -37,7 +38,17 @@ fn merge_omega(stick: i8, button: i8) -> i8 {
 /// Runs on micro:bit v2 (nRF52833)
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-  let p = embassy_nrf::init(Default::default());
+  // The nRF52833 RADIO peripheral (BLE / IEEE 802.15.4) requires the
+  // 32 MHz external crystal as its high-frequency clock; the internal
+  // RC oscillator cannot drive the RF PLL. micro:bit v2 has the HFXO
+  // populated, but `embassy-nrf` defaults to `Internal` to support
+  // hobby boards without an external crystal, so we have to opt in
+  // explicitly here. Without this, `try_send` happily reports success
+  // while the modulator outputs garbage off-frequency, and `receive`
+  // never sees a framestart on the car side.
+  let mut config = Config::default();
+  config.hfclk_source = HfclkSource::ExternalXtal;
+  let p = embassy_nrf::init(config);
 
   info!("Controller firmware started");
 

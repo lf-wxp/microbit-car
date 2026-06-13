@@ -224,9 +224,9 @@ fn encode_pixels(pixels: &[Rgb; NUM_LEDS], buf: &mut [u16; FRAME_WORDS]) {
 
 /// Convert one colour byte to 8 PWM duty words, MSB first.
 fn write_byte(slot: &mut [u16], byte: u8) {
-  for i in 0..8 {
+  for (i, word) in slot.iter_mut().enumerate().take(8) {
     let bit_high = (byte >> (7 - i)) & 1 != 0;
-    slot[i] = if bit_high { WORD_T1 } else { WORD_T0 };
+    *word = if bit_high { WORD_T1 } else { WORD_T0 };
   }
 }
 
@@ -281,12 +281,7 @@ pub async fn rgb_task(mut driver: Ws2812) {
     // Wait for whichever happens first: a fresh state, or the animation
     // deadline. Using `select` keeps the task responsive without busy
     // polling.
-    match embassy_futures::select::select(
-      RGB_STATE.wait(),
-      Timer::at(next_tick),
-    )
-    .await
-    {
+    match embassy_futures::select::select(RGB_STATE.wait(), Timer::at(next_tick)).await {
       embassy_futures::select::Either::First(new_state) => {
         state = new_state;
       }
@@ -349,12 +344,7 @@ mod tests {
   #[test]
   fn encode_first_led_g_msb() {
     // G byte's MSB on LED0 is buf[0]: green = 0x80 -> first word T1.
-    let pixels = [
-      Rgb::new(0, 0x80, 0),
-      Rgb::OFF,
-      Rgb::OFF,
-      Rgb::OFF,
-    ];
+    let pixels = [Rgb::new(0, 0x80, 0), Rgb::OFF, Rgb::OFF, Rgb::OFF];
     let mut buf = [0u16; FRAME_WORDS];
     encode_pixels(&pixels, &mut buf);
     assert_eq!(buf[0], WORD_T1);

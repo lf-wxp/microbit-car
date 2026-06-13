@@ -36,6 +36,9 @@ phone needed.
     - [Fusion loop](#fusion-loop)
     - [Status indicator (RGB LEDs)](#status-indicator-rgb-leds)
   - [Car design](#car-design)
+  - [Diagnostic mode](#diagnostic-mode)
+  - [Failsafe behaviour](#failsafe-behaviour)
+  - [Hardware quirks (buzzer \& PWM carrier)](#hardware-quirks-buzzer--pwm-carrier)
   - [Pin map (cheat-sheet)](#pin-map-cheat-sheet)
     - [Controller (micro:bit v2)](#controller-microbit-v2)
     - [Car (micro:bit v2 + MotorBit shield)](#car-microbit-v2--motorbit-shield)
@@ -109,15 +112,15 @@ microbit-car/
 │       ├── display.rs  # 5×5 LED matrix indicator (motion direction)
 │       └── rgb.rs      # 4× WS2812 status LEDs on P8 (link state on LED0)
 │
-└── car/                # Car firmware (binary crate)
+├── car/                # Car firmware (binary crate)
     └── src/
-        ├── main.rs     # Embassy `main`, motor driver + radio RX glue
-        ├── radio.rs    # 802.15.4 RX task, dispatches Motion / E-Stop / HB
-        ├── motor.rs    # MotorDriver: Mecanum inverse kinematics + I²C init
-        ├── motorbit.rs # MotorBit shield abstraction (4 DC motors + 8 servos)
-        └── pca9685.rs  # Low-level PCA9685 PWM driver
+        ├── main.rs        # Embassy `main`, motor driver + radio RX glue + RX failsafe
+        ├── radio.rs       # 802.15.4 RX task, dispatches Motion / E-Stop / HB
+        ├── diagnostic.rs  # Boot-time A-button motor wiring sweep (M1→M2→M3→M4)
+        ├── motor.rs       # MotorDriver: Mecanum inverse kinematics + I²C init
+        ├── motorbit.rs    # MotorBit shield abstraction (4 DC motors + 8 servos)
+        └── pca9685.rs     # Low-level PCA9685 PWM driver (carrier @ 1.5 kHz)
 ```
-
 ---
 
 ## System architecture
@@ -195,11 +198,21 @@ in a single 32-byte 802.15.4 frame.
 
 | Type            | Direction        | Payload                | Purpose                                |
 |-----------------|------------------|------------------------|----------------------------------------|
-| `Heartbeat`     | both ways        | none                   | Liveness / connection indicator        |
+| `Heartbeat`     | both ways        | none                   | Liveness / connection indicator (5 Hz) |
 | `Motion`        | controller → car | `MotionPayload` (3 B)  | `(vx, vy, omega)` velocity vector      |
 | `EmergencyStop` | controller → car | none                   | Force the car to stop, retried 5×      |
 | `Response`      | car → controller | `ResponsePayload` (2B) | `CarStatus` + extra info byte          |
 | `Telemetry`     | car → controller | `TelemetryPayload`(6B) | Battery / speed / heading / vx/vy/ω    |
+
+> **ACK policy:** the car **does not ACK every `Motion` packet**. The
+> controller streams motion at ~50 Hz; ACKing each one turned the radio
+> into a 50 Hz TX burst source, which the micro:bit's on-board buck
+> regulator and the MotorBit's power-filter inductors picked up as a
+> faint but audible low-frequency hum (electromagnetic-induced acoustic
+> noise / coil whine). Link liveness is instead carried entirely by the
+> `Heartbeat` reply path (~5 Hz), which is what the controller's RGB
+> indicator uses to drive its `ConnectionState`. `EmergencyStop` is still
+> ACK'd individually because it's a one-shot critical event.
 
 ### `MotionPayload` semantics
 
@@ -215,11 +228,14 @@ Mecanum inverse kinematics on the car side
 (see `car/src/motor.rs::apply_motion`):
 
 ```text
-motor_FL (M1) = vx - vy - k * omega
-motor_FR (M2) = vx + vy + k * omega
-motor_RL (M3) = vx + vy - k * omega
-motor_RR (M4) = vx - vy + k * omega
+motor_FL (M1) = vx + vy - k * omega
+motor_FR (M2) = vx - vy + k * omega
+motor_RL (M3) = vx - vy - k * omega
+motor_RR (M4) = vx + vy + k * omega
 ```
+
+Sign convention is `vx>0 = forward`, `vy>0 = strafe right`,
+`omega>0 = clockwise (viewed from above)`.
 
 After the four raw values are computed they are normalised to fit
 `[-100, 100]`, then mapped to the PCA9685 range `[-4095, 4095]`. `k` is a
@@ -396,21 +412,37 @@ render-side change: extend [`RgbState`](controller/src/rgb.rs) and the
 `car/src/main.rs` keeps things deliberately small:
 
 ```rust
+// Pin P0_02 low at boot to silence the on-board buzzer line
+// regardless of the MotorBit slide switch position (see
+// "Hardware quirks" below).
+let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
+
+// Optional: tap the A button (P0_14) within the first 2 s to enter
+// the motor wiring diagnostic instead of the normal radio loop.
+if diagnostic::is_diagnostic_requested(p.P0_14).await {
+    let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
+    diagnostic::run(&mut motor_driver).await; // -> !
+}
+
 let radio = radio::init(p.RADIO);
 spawner.spawn(radio::radio_rx_task(radio).unwrap());
-
 let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
 
 loop {
-    let motion = radio::MOTION_CHANNEL.receive().await;
-    motor_driver.apply_motion(&motion).await;
+    // `select` between a fresh motion packet and a 100 ms watchdog tick
+    // that enforces the link-loss failsafe (see "Failsafe behaviour").
+    match select(radio::MOTION_CHANNEL.receive(), Timer::after_millis(100)).await {
+        Either::First(motion) => motor_driver.apply_motion(&motion).await,
+        Either::Second(_)     => check_failsafe_and_maybe_stop(&mut motor_driver).await,
+    }
 }
 ```
 
 - **`radio::radio_rx_task`** validates the version, dispatches by
-  `MessageType`, ACKs `Motion` / `EmergencyStop`, mirrors `Heartbeat`s
-  back, and pushes successfully parsed `MotionPayload`s onto
-  `MOTION_CHANNEL`.
+  `MessageType`, ACKs `Heartbeat`s and `EmergencyStop`, and pushes
+  successfully parsed `MotionPayload`s onto `MOTION_CHANNEL`.
+  **It does not ACK `Motion`** — see the "ACK policy" callout under
+  [Message types](#message-types).
 - **`MotorDriver::apply_motion`** runs the inverse kinematics, normalises,
   scales `[-100..100]` to `[-4095..4095]`, then drives M1–M4 via the
   `MotorBit` → `PCA9685` stack.
@@ -418,6 +450,113 @@ loop {
   `set_servo_duty` for S1–S8, so adding a pan/tilt camera or a gripper is
   just a matter of grabbing `motor_driver.twim_mut()` and instantiating
   a `Pca9685::resume(...)` + `MotorBit::new(...)` pair.
+
+---
+
+## Diagnostic mode
+
+When you wire up a fresh chassis, the very first question is always
+*"is M1 actually the front-left wheel, and is its `+` direction
+actually forward?"* The car firmware ships with a built-in motor
+wiring sweep that answers exactly that question, **without involving
+the radio link or the controller**.
+
+**How to enter:** power on the car and **tap the on-board A button**
+(the left tactile button on the micro:bit, GPIO `P0_14`) within the
+first **2 s**. A short tap is enough — there is no need to hold it
+down or coordinate with the reset key.
+
+**What it does:** the firmware skips radio init entirely and runs an
+infinite loop that drives **one motor at a time** to ~50 % PWM duty:
+
+```text
+for each cycle:
+  M1 front-left  : forward 1 s, stop, backward 1 s, stop
+  M2 front-right : forward 1 s, stop, backward 1 s, stop
+  M3 rear-left   : forward 1 s, stop, backward 1 s, stop
+  M4 rear-right  : forward 1 s, stop, backward 1 s, stop
+  pause 2 s, repeat
+```
+
+Each phase is announced over `defmt`, so you can correlate the log
+with the wheel that's physically spinning. **"Forward" here is the
+direction that PCA9685 reports as positive** — if a wheel rolls the
+chassis backwards when the log says `FORWARD`, swap its two motor
+wires (do **not** change code).
+
+Power-cycle or press the reset key to leave diagnostic mode.
+
+See [`car/src/diagnostic.rs`](car/src/diagnostic.rs) for the source.
+
+---
+
+## Failsafe behaviour
+
+The car's main loop is paranoid about losing contact with the
+controller. Two independent timeouts cooperate:
+
+| Layer       | Where                          | Trigger                                                 | Action                                  |
+|-------------|--------------------------------|---------------------------------------------------------|-----------------------------------------|
+| Application | `car/src/main.rs`              | No inbound packet of *any* kind for `FAILSAFE_TIMEOUT_MS` (= 500 ms) | `MotorDriver::stop_all()`, status LED off |
+| Link        | `controller/src/radio.rs`      | No `Heartbeat` reply for `HEARTBEAT_TIMEOUT_MS` (= 600 ms) | RGB LED0 turns red on the controller   |
+
+Because heartbeats arrive at ~5 Hz (every 200 ms) and motion at ~50 Hz,
+500 ms of silence is a comfortable margin: a single dropped frame is
+unnoticeable, three missed heartbeats stop the car. The watchdog uses
+`Instant::now()` against `radio::last_rx_millis()`, which is updated on
+*every* successfully parsed packet — Motion, Heartbeat or E-Stop — so
+even if the controller is sending heartbeats with no motion the link
+is still considered alive.
+
+Failsafe state is **sticky-until-cleared**: once engaged, the car stays
+stopped (and we don't hammer the I²C bus restating "all motors off"
+every 100 ms) until a new packet arrives, at which point the loop
+resumes normally. Boot also counts as failsafe (`last_rx == 0`), so
+the wheels never spin until the radio link is up.
+
+---
+
+## Hardware quirks (buzzer & PWM carrier)
+
+Two small but important mitigations live in the firmware specifically
+to silence noises the MotorBit shield otherwise makes.
+
+### 1. Buzzer line held low at boot (`P0_02`)
+
+MotorBit V1.0 / V2.0 wires its on-board passive buzzer to micro:bit
+`P0` (= nRF52833 `P0_02`) through a slide switch. With the switch
+**ON**, `P0_02` is electrically connected to the buzzer; an
+undriven (floating) pin can pick up crosstalk from neighbouring
+traces and cause the buzzer to chirp continuously.
+
+The car firmware therefore allocates `P0_02` as a GPIO output held
+**Low** for the entire lifetime of the program, so the buzzer stays
+quiet **regardless of the slide-switch position**:
+
+```rust
+let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
+```
+
+The leading underscore keeps the binding alive (a bare `_` would drop
+it immediately and free the pin). If you actually *want* to use the
+buzzer for tones / alerts, delete this line and drive `P0_02` from a
+PWM peripheral instead.
+
+### 2. PCA9685 carrier at 1.5 kHz, not 50 Hz
+
+The stock PCA9685 default carrier is **50 Hz** (designed for hobby
+servos). At 50 Hz, the brushed-DC motors and the H-bridge filtering
+inductors on MotorBit resonate audibly — you hear a low *buzz* or
+*hum* whenever any motor is energised, even at rest.
+
+[`car/src/pca9685.rs`](car/src/pca9685.rs) therefore raises the carrier
+to `DEFAULT_PWM_FREQ_HZ = 1500`, which is well above the human voice
+band and inaudible on commodity DC motors. The change is invisible to
+the rest of the stack: PWM duty is still expressed as 0..=4095 / cycle,
+and servos on S1–S8 (which assume 50 Hz) are not used by the default
+firmware. **If you wire up servos**, drop the frequency back down (or
+put servos on a separate driver) — most hobby servos won't tolerate
+1.5 kHz pulse rates.
 
 ---
 
@@ -442,16 +581,18 @@ loop {
 
 ### Car (micro:bit v2 + MotorBit shield)
 
-| Function                       | Edge connector | nRF52833 GPIO | Notes                       |
-|--------------------------------|----------------|---------------|-----------------------------|
-| I²C SCL → PCA9685              | **P19**        | `P0.26`       | TWIM0                       |
-| I²C SDA → PCA9685              | **P20**        | `P1.00`       | TWIM0                       |
-| PCA9685 channels CH0/CH1       | (on shield)    | —             | Motor M1 (FL) +/- terminals |
-| PCA9685 channels CH2/CH3       | (on shield)    | —             | Motor M2 (FR) +/- terminals |
-| PCA9685 channels CH4/CH5       | (on shield)    | —             | Motor M3 (RL) +/- terminals |
-| PCA9685 channels CH6/CH7       | (on shield)    | —             | Motor M4 (RR) +/- terminals |
-| PCA9685 channels CH8..CH15     | (on shield)    | —             | Servo headers S1..S8        |
-| Status LED                     | row1/col1      | `P0.21`/`P0.28`| Lit while a motion ≠ 0      |
+| Function                       | Edge connector | nRF52833 GPIO | Notes                                          |
+|--------------------------------|----------------|---------------|------------------------------------------------|
+| I²C SCL → PCA9685              | **P19**        | `P0.26`       | TWIM0                                          |
+| I²C SDA → PCA9685              | **P20**        | `P1.00`       | TWIM0                                          |
+| **A button** (diagnostic mode) | on-board       | `P0.14`       | Active-low, internal `Pull::Up`; tap within 2 s of boot |
+| **Buzzer line** (held low)     | **P0**         | `P0.02`       | GPIO Output Low; silences MotorBit buzzer      |
+| PCA9685 channels CH0/CH1       | (on shield)    | —             | Motor M1 (FL) +/- terminals                    |
+| PCA9685 channels CH2/CH3       | (on shield)    | —             | Motor M2 (FR) +/- terminals                    |
+| PCA9685 channels CH4/CH5       | (on shield)    | —             | Motor M3 (RL) +/- terminals                    |
+| PCA9685 channels CH6/CH7       | (on shield)    | —             | Motor M4 (RR) +/- terminals                    |
+| PCA9685 channels CH8..CH15     | (on shield)    | —             | Servo headers S1..S8 (50 Hz **not** active — see Hardware quirks) |
+| Status LED                     | row1/col1      | `P0.21`/`P0.28`| Lit while a motion ≠ 0, or solid in diagnostic mode |
 
 > **Wheel layout (top view, motor → corner mapping):**
 > `M1 = front-left`, `M2 = front-right`, `M3 = rear-left`, `M4 = rear-right`.
@@ -523,6 +664,11 @@ cargo make clean              # cargo clean
 
 ## Driving the car
 
+0. *(Optional, first time on a new chassis)* Power up the car and tap
+   the on-board **A button** within 2 s to run the
+   [Diagnostic mode](#diagnostic-mode) wiring sweep. Once you've
+   verified each wheel responds in the correct direction, power-cycle
+   to leave diagnostic mode.
 1. Power up the **car** (battery on the MotorBit shield).
 2. Power up the **controller** (USB power bank or coin-cell pack).
 3. Watch the **first RGB LED** on the controller's extension board
@@ -550,10 +696,11 @@ cargo make clean              # cargo clean
    to ±100**, so the buttons act as fine trim on top of the stick.
 8. Letting go of all inputs immediately sends `(0, 0, 0)`; the car halts.
 9. The car also halts on its own if it stops hearing from the controller
-   for `HEARTBEAT_TIMEOUT_MS` (600 ms by default — set in
-   `radio-core` as `3 × HEARTBEAT_INTERVAL_MS`). When that happens, the
-   controller's RGB indicator turns red, so you get a visual cue that
-   the link is gone before you wonder why the car stopped responding.
+   for `FAILSAFE_TIMEOUT_MS` (500 ms, see
+   [Failsafe behaviour](#failsafe-behaviour)). The controller in turn
+   flips its RGB indicator to red after `HEARTBEAT_TIMEOUT_MS` (600 ms),
+   so you get a visual cue on the controller that the link is gone
+   before you wonder why the car stopped responding.
 
 ---
 
@@ -583,7 +730,9 @@ cargo make clean              # cargo clean
 | Spinning instead of strafing when pushing the stick sideways           | Two diagonally-opposite wheels are reversed                                                   | Identify the pair from the `defmt` motor logs and flip both                                                                          |
 | Car keeps creeping after you let go of the stick                       | Joystick centre is offset (manufacturing tolerance) and exceeds `DEAD_ZONE`                   | Increase `DEAD_ZONE` in `controller/src/joystick.rs` (try `40`)                                                                      |
 | Tilt mode feels too sensitive / not sensitive enough                   | `FULL_TILT` doesn't match how far you actually tilt                                           | Tweak `FULL_TILT` and `DEAD_ZONE` in `controller/src/tilt.rs`                                                                        |
-| Car halts every ~500 ms even with the stick held                       | Heartbeat is missing — radio range / interference                                             | Move the boards closer, change `RADIO_CHANNEL`, or raise `TX_POWER` in `radio-core/src/lib.rs`                                       |
+| Car halts every ~500 ms even with the stick held                       | Failsafe firing — controller→car link is dropping packets                                     | Move the boards closer, change `RADIO_CHANNEL`, raise `TX_POWER` in `radio-core/src/lib.rs`, or relax `FAILSAFE_TIMEOUT_MS` in `car/src/main.rs` |
+| Car spins / strafes wrong, but you can't tell which wheel is at fault  | Hard to diagnose under joystick control                                                       | Power-cycle and tap the **A button** within 2 s to enter [Diagnostic mode](#diagnostic-mode), then watch which wheel turns when      |
+| Continuous low buzz / hum from the chassis even at rest                | PCA9685 carrier reverted to 50 Hz, or `P0_02` left floating with the buzzer switch ON         | Verify `DEFAULT_PWM_FREQ_HZ = 1500` in `car/src/pca9685.rs`, and that `Output::new(p.P0_02, Level::Low, ...)` is still in `main.rs` (see [Hardware quirks](#hardware-quirks-buzzer--pwm-carrier)) |
 | `cargo build` fails with **"target 'thumbv7em-none-eabihf' not found"** | Cross-compile target missing                                                                  | `rustup target add thumbv7em-none-eabihf`                                                                                            |
 | `cargo install probe-rs` fails on macOS                                | `libusb` / `libudev` headers missing                                                          | `brew install libusb pkg-config`                                                                                                     |
 | Controller works but tilt mode never engages                           | Shield button A wiring or `Pull::Up` mismatch                                                 | Check P13 with a multimeter; the line should be high at idle, low when pressed                                                       |

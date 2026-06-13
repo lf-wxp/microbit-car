@@ -40,12 +40,24 @@ pub const M4: u8 = 3;
 // --- DC Motor Channel Mapping ---
 
 /// Motor channel mapping: [(positive_channel, negative_channel); 4]
-/// Matches DcMotor initialization parameters in motorbit.py
+///
+/// Hardware-polarity compensation: on this particular chassis, the
+/// right-hand side motors (M2 front-right and M4 rear-right) are wired
+/// with opposite polarity to the left-hand side. Rather than rewiring
+/// the screw terminals or contaminating the Mecanum kinematics in
+/// `motor.rs`, we encode that asymmetry here once, where it logically
+/// belongs (hardware abstraction layer).
+///
+/// Verified empirically via `diagnostic.rs`:
+/// - M1 (left-front)  forward → wheel rolls forward (OK)
+/// - M2 (right-front) forward → wheel rolled backward (inverted here)
+/// - M3 (left-rear)   forward → wheel rolls forward (OK)
+/// - M4 (right-rear)  forward → wheel rolled backward (inverted here)
 const DC_MOTOR_CHANNELS: [(u8, u8); 4] = [
-  (pca9685::CH0, pca9685::CH1), // M1: A01, A02
-  (pca9685::CH2, pca9685::CH3), // M2: A03, A04
-  (pca9685::CH4, pca9685::CH5), // M3: B01, B02
-  (pca9685::CH6, pca9685::CH7), // M4: B03, B04
+  (pca9685::CH0, pca9685::CH1), // M1: A01, A02 (as-is)
+  (pca9685::CH3, pca9685::CH2), // M2: A04, A03 (swapped to invert polarity)
+  (pca9685::CH4, pca9685::CH5), // M3: B01, B02 (as-is)
+  (pca9685::CH7, pca9685::CH6), // M4: B04, B03 (swapped to invert polarity)
 ];
 
 // --- Servo Channel Mapping ---
@@ -112,7 +124,8 @@ pub struct MotorBit<'a, 'b> {
 impl<'a, 'b> MotorBit<'a, 'b> {
   /// Create MotorBit driver instance
   ///
-  /// PCA9685 should already be initialized to 50Hz.
+  /// PCA9685 should already be initialized (frequency configured by
+  /// the caller via `Pca9685::new` or `Pca9685::set_frequency_hz`).
   pub fn new(pca9685: &'b mut Pca9685<'a>) -> Self {
     Self {
       pca9685,
@@ -133,6 +146,14 @@ impl<'a, 'b> MotorBit<'a, 'b> {
   /// - speed >= 0: positive_channel = |speed|, negative_channel = 0
   /// - speed < 0:  negative_channel = |speed|, positive_channel = 0
   ///
+  /// Special case: when `speed == 0`, both channels are forced into
+  /// PCA9685 "full OFF" state (datasheet bit `LEDx_OFF_H[4]`) instead
+  /// of being written with 0% duty. A 0% duty cycle still drives the
+  /// modulator and leaks audible switching noise into the H-bridge /
+  /// motor coil at the kHz-range carrier we use; full-OFF cuts the
+  /// modulator and produces a clean DC-ground level, so the chassis
+  /// is silent when standing still.
+  ///
   /// # Arguments
   /// - `motor`: Motor index (M1=0, M2=1, M3=2, M4=3)
   /// - `speed`: Speed value (-4095 ~ +4095)
@@ -148,12 +169,17 @@ impl<'a, 'b> MotorBit<'a, 'b> {
 
     let (pos_ch, neg_ch) = DC_MOTOR_CHANNELS[motor as usize];
 
-    if speed >= 0 {
+    if speed == 0 {
+      // Idle: hard-disable both half-bridge inputs so the H-bridge
+      // doesn't switch at the PWM carrier when the chassis is stopped.
+      self.pca9685.set_full_off(pos_ch).await;
+      self.pca9685.set_full_off(neg_ch).await;
+    } else if speed > 0 {
       self.pca9685.duty(pos_ch, speed.unsigned_abs()).await;
-      self.pca9685.duty(neg_ch, 0).await;
+      self.pca9685.set_full_off(neg_ch).await;
     } else {
       self.pca9685.duty(neg_ch, speed.unsigned_abs()).await;
-      self.pca9685.duty(pos_ch, 0).await;
+      self.pca9685.set_full_off(pos_ch).await;
     }
 
     trace!("DC motor M{}: speed={}", motor + 1, speed);

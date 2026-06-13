@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 embassy-nrf.workspace = true
 embassy-time.workspace = true
+embassy-futures.workspace = true
 defmt.workspace = true
 protocol.workspace = true
 

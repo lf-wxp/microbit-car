@@ -5,7 +5,8 @@
 //! Provides common radio configuration, initialization, and low-level
 //! packet send/receive utilities used by both the car and controller firmware.
 
-use embassy_nrf::radio::ieee802154::{Packet, Radio};
+use embassy_futures::select::{Either, select};
+use embassy_nrf::radio::ieee802154::{Cca, Packet, Radio};
 use embassy_nrf::{Peri, bind_interrupts, peripherals, radio};
 use embassy_time::{Duration, Timer};
 
@@ -29,6 +30,16 @@ pub const MAX_EMERGENCY_RETRIES: u8 = 5;
 /// Retry delay between TX attempts in microseconds
 pub const TX_RETRY_DELAY_US: u64 = 200;
 
+/// Hard timeout for a single `try_send` call.
+///
+/// `embassy-nrf`'s IEEE 802.15.4 driver can leave the RADIO state
+/// machine in a state where `try_send` never resolves (neither
+/// `phyend` nor `ccabusy` ever fires). To stop a stuck transmit from
+/// hanging the whole radio task, we race the call against a short
+/// timer and treat the timeout as a transient failure that triggers
+/// a retry.
+pub const TX_ATTEMPT_TIMEOUT_MS: u64 = 5;
+
 /// Heartbeat interval in milliseconds (controller -> car)
 pub const HEARTBEAT_INTERVAL_MS: u64 = 200;
 
@@ -51,8 +62,18 @@ pub fn init(radio_periph: Peri<'static, peripherals::RADIO>, role: &str) -> Radi
   let mut radio = Radio::new(radio_periph, Irqs);
   radio.set_channel(RADIO_CHANNEL);
   radio.set_transmission_power(TX_POWER);
+  // Effectively disable CCA for this private point-to-point link.
+  //
+  // The default `Cca::CarrierSense` mode aborts transmission whenever ANY
+  // 2.4 GHz signal is sensed (BLE advertisements, WiFi, etc.), causing
+  // `try_send` to return `Err(ChannelInUse)` indefinitely in noisy RF
+  // environments. Since this project uses a dedicated PHY-only link with
+  // no 802.15.4 coexistence requirements, we set the energy detection
+  // threshold to its maximum (0xFF) so the channel is always considered
+  // clear and packets are always transmitted.
+  radio.set_cca(Cca::EnergyDetection { ed_threshold: 0xFF });
   info!(
-    "{} radio initialized: channel={}, tx_power={}dBm",
+    "{} radio initialized: channel={}, tx_power={}dBm, cca=disabled",
     role, RADIO_CHANNEL, TX_POWER
   );
   radio
@@ -75,20 +96,44 @@ pub async fn send_packet_with_retries(
   let mut tx_packet = Packet::new();
   tx_packet.copy_from_slice(&buf[..len]);
 
+  let mut succeeded = false;
+
   for attempt in 0..max_retries {
-    match radio.try_send(&mut tx_packet).await {
-      Ok(()) => {
+    // Race the radio's `try_send` future against a short timeout so a
+    // wedged peripheral state machine cannot block the caller forever.
+    let send_fut = radio.try_send(&mut tx_packet);
+    let timeout_fut = Timer::after(Duration::from_millis(TX_ATTEMPT_TIMEOUT_MS));
+    match select(send_fut, timeout_fut).await {
+      Either::First(Ok(())) => {
         trace!("TX success (attempt {})", attempt + 1);
-        return true;
+        succeeded = true;
+        break;
       }
-      Err(e) => {
-        trace!("TX failed (attempt {}): {:?}", attempt + 1, e);
+      Either::First(Err(e)) => {
+        // Diagnostic-level logging: surface CCA / channel issues so that
+        // link-layer problems are visible without enabling the trace level.
+        warn!("TX failed (attempt {}): {:?}", attempt + 1, e);
+        Timer::after(Duration::from_micros(TX_RETRY_DELAY_US)).await;
+      }
+      Either::Second(_) => {
+        // try_send never resolved within the budget. Most often this
+        // means the RADIO peripheral is stuck mid state-transition;
+        // `select` cancels the future on drop which lets embassy-nrf
+        // run its `OnDrop` cleanup and reset the state machine.
+        warn!(
+          "TX timeout (attempt {}, {}ms)",
+          attempt + 1,
+          TX_ATTEMPT_TIMEOUT_MS
+        );
         Timer::after(Duration::from_micros(TX_RETRY_DELAY_US)).await;
       }
     }
   }
-  warn!("TX failed after {} retries", max_retries);
-  false
+
+  if !succeeded {
+    warn!("TX failed after {} retries", max_retries);
+  }
+  succeeded
 }
 
 /// Send a radio packet with default retry count (MAX_TX_RETRIES).

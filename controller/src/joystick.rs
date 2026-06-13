@@ -47,9 +47,10 @@ impl JoystickState {
   /// Run a fresh ADC sample through the shared DSP pipeline and assemble
   /// the resulting `MotionPayload`.
   ///
-  /// Axis convention: right stick X (right = positive) maps to `vy`,
-  /// stick Y (forward = positive) maps to `vx`. `omega` is left at 0;
-  /// rotation is provided by the buttons / right stick instead.
+  /// Axis convention: stick X (right = positive raw) maps to `vy`
+  /// (rightward strafe = positive), stick Y (forward = positive raw)
+  /// maps to `vx` (forward = positive). `omega` is left at 0; rotation
+  /// is provided by the buttons / right stick instead.
   fn update(&mut self, raw_x: i16, raw_y: i16) -> MotionPayload {
     let smoothed_x = signal::process_axis(raw_x, &mut self.filter_x, DEFAULT_DEAD_ZONE);
     let smoothed_y = signal::process_axis(raw_y, &mut self.filter_y, DEFAULT_DEAD_ZONE);
