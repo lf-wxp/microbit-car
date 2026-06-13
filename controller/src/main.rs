@@ -181,10 +181,19 @@ async fn main(spawner: Spawner) {
       },
     }
 
+    // Protocol-level dead zone: suppress residual small values that
+    // escape the analog dead zone + EMA pipeline, so the car's motors
+    // stay completely quiet when the user isn't touching any control.
+    // The EMA snap-to-zero (signal.rs) handles most of the decay tail,
+    // but a secondary filter here catches any edge case (e.g. ADC
+    // bias causing asymmetric decay, or the first non-zero sample
+    // after a long idle that slips through the EMA).
+    let proto_dz = |v: i8| -> i8 { if (-3..=3).contains(&v) { 0 } else { v } };
+
     let combined = MotionPayload {
-      vx: last_vx,
-      vy: last_vy,
-      omega: merge_omega(last_stick_omega, last_button_omega),
+      vx: proto_dz(last_vx),
+      vy: proto_dz(last_vy),
+      omega: proto_dz(merge_omega(last_stick_omega, last_button_omega)),
     };
     radio::MOTION_TX_CHANNEL.send(combined).await;
 

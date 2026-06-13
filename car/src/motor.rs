@@ -61,6 +61,22 @@ const GEOMETRY_FACTOR_K: i32 = 1;
 /// Speed percentage to PWM value mapping scale (4095 / 100)
 const SPEED_TO_PWM_SCALE: i32 = 40; // approx 4095/100 ≈ 40.95, use 40
 
+/// Joystick dead zone threshold.
+///
+/// The controller's analog joystick emits small non-zero values (±1~±3)
+/// even when centred, due to ADC noise, mechanical drift, and EMA
+/// decay tails.  Any value whose absolute magnitude falls within this
+/// threshold is treated as zero, preventing the car from creeping or
+/// emitting audible coil whine when the operator isn't touching the
+/// stick.
+///
+/// Set to `3`; the controller already applies its own dead-zone
+/// (`signal::DEFAULT_DEAD_ZONE`), snap-to-zero in the EMA filter,
+/// and a protocol-level dead zone (`proto_dz` in `main.rs`), but a
+/// safety margin here guarantees that any residual noise that escapes
+/// the controller pipeline is silenced before it reaches the motors.
+const DEAD_ZONE: i8 = 3;
+
 // --- I2C Interrupt Binding ---
 
 bind_interrupts!(struct Irqs {
@@ -141,17 +157,36 @@ impl MotorDriver {
   /// Performs inverse kinematics calculation, converts (vx, vy, omega) to 4 motor speed values,
   /// and outputs PWM signals via PCA9685.
   pub async fn apply_motion(&mut self, motion: &MotionPayload) {
+    // Apply dead zone: treat small analog values as zero so that
+    // joystick noise doesn't trickle into the motors as audible
+    // whine or micro-creep when the stick is centred.
+    let vx = if motion.vx.unsigned_abs() <= DEAD_ZONE as u8 {
+      0
+    } else {
+      motion.vx
+    };
+    let vy = if motion.vy.unsigned_abs() <= DEAD_ZONE as u8 {
+      0
+    } else {
+      motion.vy
+    };
+    let omega = if motion.omega.unsigned_abs() <= DEAD_ZONE as u8 {
+      0
+    } else {
+      motion.omega
+    };
+
     // Fast path: all zeros means stop immediately
-    if motion.vx == 0 && motion.vy == 0 && motion.omega == 0 {
+    if vx == 0 && vy == 0 && omega == 0 {
       self.stop_all().await;
       return;
     }
 
     // Inverse kinematics calculation (input range [-100, 100]).
     // See module-level docs for the convention and derivation.
-    let vx = motion.vx as i32;
-    let vy = motion.vy as i32;
-    let omega = motion.omega as i32;
+    let vx = vx as i32;
+    let vy = vy as i32;
+    let omega = omega as i32;
 
     let raw_fl = vx + vy - GEOMETRY_FACTOR_K * omega;
     let raw_fr = vx - vy + GEOMETRY_FACTOR_K * omega;

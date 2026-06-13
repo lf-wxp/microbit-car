@@ -88,8 +88,38 @@ impl EmaFilter {
   }
 
   /// EMA update step: `state = (num * sample + (den - num) * state) / den`.
+  ///
+  /// When `sample == 0` (joystick centred) the EMA state decays
+  /// exponentially but integer division causes it to linger at small
+  /// non-zero values like `±3`, `±2`, `±1` before finally reaching
+  /// zero.  Each of those intermediate values produces a tiny motor
+  /// command that the car hears as audible coil whine or causes a
+  /// brief creep after the operator releases the stick.
+  ///
+  /// The snap-to-zero threshold below is chosen so that any residual
+  /// state whose magnitude would produce a PWM duty cycle below the
+  /// motor's stiction threshold is eliminated immediately.  With
+  /// `SPEED_TO_PWM_SCALE = 40` (motor.rs), a raw value of `±3` maps
+  /// to `±120` out of `4095` (~3%), well below any visible motion
+  /// but still loud enough to be audible.  We snap anything whose
+  /// absolute value is ≤ `SNAP_THRESHOLD` to zero as soon as the
+  /// input goes idle.
+  const SNAP_THRESHOLD: i32 = 5;
+
   #[inline]
   pub fn update(&mut self, sample: i32, num: i32, den: i32) -> i32 {
+    // Fast path: already idle and no new input → stay at zero.
+    if sample == 0 && self.state == 0 {
+      return 0;
+    }
+    // Snap-to-zero: when the input is idle and the residual state
+    // is small enough that it represents only noise / decay tail,
+    // jump to zero immediately rather than letting it slowly decay
+    // through ±5 → ±3 → ±2 → ±1 → 0.
+    if sample == 0 && self.state.abs() <= Self::SNAP_THRESHOLD {
+      self.state = 0;
+      return 0;
+    }
     self.state = (num * sample + (den - num) * self.state) / den;
     self.state
   }

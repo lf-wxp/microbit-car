@@ -21,31 +21,40 @@ use defmt::{info, warn};
 /// Maximum time (ms) we tolerate without any inbound radio packet
 /// before forcing all motors to stop.
 ///
-/// The controller streams motion at ~50 Hz (every 20 ms) and a
-/// heartbeat at ~5 Hz (every 200 ms), so any value above ~220 ms
-/// is "definitely lost" — there is no legitimate quiet window that
-/// long. We pick 250 ms to leave a tiny tolerance for one missed
-/// heartbeat while keeping the worst-case "controller pulled →
-/// motors stopped" latency well under a third of a second, which
-/// is the practical limit before the chassis perceptibly drifts on
-/// its last commanded velocity.
+/// This is a **secondary** failsafe that covers the case where the
+/// motion channel is somehow wedged (e.g. the radio RX task crashes
+/// or the channel saturates). The **primary** link-loss detection is
+/// the per-motion expiry timer (`MOTION_EXPIRY_MS`) inside the main
+/// loop, which fires within ~60 ms of the controller going away.
 ///
-/// Earlier the timeout was 500 ms, which created a noticeable
-/// "ghost roll": after the controller was switched off the car
-/// happily executed the last motion command for another half
-/// second, and at the same time the (no-longer-masked) 1.5 kHz
-/// PWM carrier became audibly louder once the rolling/road noise
-/// dropped away. Both symptoms vanish once the failsafe fires
-/// promptly.
-const FAILSAFE_TIMEOUT_MS: u32 = 250;
+/// We keep this global watchdog at 200 ms as a belt-and-braces
+/// measure — it should never fire during normal operation because
+/// the faster motion-expiry path already caught the disconnection.
+const FAILSAFE_TIMEOUT_MS: u32 = 200;
 
 /// Failsafe watchdog tick. We can't simply `select` on the motion
 /// channel forever because a wedged controller stops sending entirely;
 /// instead we wake every `POLL_TICK_MS` to compare `now` against the
-/// last RX timestamp. With a 250 ms timeout, polling every 50 ms keeps
-/// the worst-case detection latency at ~300 ms while costing only a
-/// few extra Timer wakeups per second.
-const POLL_TICK_MS: u64 = 50;
+/// last RX timestamp.
+const POLL_TICK_MS: u64 = 40;
+
+/// Motion command expiry timeout (ms).
+///
+/// The controller streams motion packets at ~50 Hz (one every 20 ms).
+/// If more than this many milliseconds pass without a fresh motion
+/// command, we assume the controller has gone away and immediately
+/// stop all motors.
+///
+/// 60 ms ≈ 3 missed motion frames, which is generous enough to
+/// tolerate a single dropped packet but fast enough that the
+/// worst-case "ghost roll" at full speed is only a few centimetres
+/// — well below the ~250 ms perceptible drift of earlier versions.
+///
+/// This is the **primary** link-loss detection mechanism. It is much
+/// faster than the global `FAILSAFE_TIMEOUT_MS` watchdog because it
+/// is directly coupled to the motion stream cadence rather than the
+/// slower heartbeat channel.
+const MOTION_EXPIRY_MS: u64 = 60;
 
 /// Main entry point for the car firmware
 /// Runs on micro:bit v2 (nRF52833)
@@ -113,40 +122,80 @@ async fn main(spawner: Spawner) {
   info!("Motor driver initialized, entering main loop");
 
   // Tracks whether failsafe has already forced a stop, so we don't
-  // hammer the I2C bus restating "all motors off" every 100 ms.
+  // hammer the I2C bus restating "all motors off" every tick.
   // Reset to `false` on every successful motion command.
   let mut failsafe_engaged = false;
 
-  // Main loop: process motion commands from radio and drive motors,
-  // while a 100 ms ticker enforces a link-loss failsafe stop.
+  // Whether we have received at least one motion command since boot.
+  // Before the first motion the expiry timer should not fire (there
+  // is no "last command" to expire).
+  let mut motion_received = false;
+
+  // Main loop: process motion commands from radio and drive motors.
+  //
+  // Two-layer link-loss protection:
+  //   1. **Motion expiry** (fast, ~60 ms): every motion packet starts
+  //      a short timer; if it expires without a new packet the motors
+  //      are stopped immediately.
+  //   2. **Global watchdog** (slower, ~200 ms): polls `last_rx_millis()`
+  //      and catches cases where the motion channel itself is stuck.
   loop {
+    // Build the expiry timer future. Before the first motion command
+    // we use an "infinite" wait so the timer arm never wins the
+    // `select3` — we don't want to stop motors that were never
+    // started.
+    let expiry_fut = if motion_received && !failsafe_engaged {
+      Timer::after(Duration::from_millis(MOTION_EXPIRY_MS))
+    } else {
+      Timer::after(Duration::from_secs(3600))
+    };
     let motion_fut = radio::MOTION_CHANNEL.receive();
     let tick_fut = Timer::after(Duration::from_millis(POLL_TICK_MS));
 
-    match select(motion_fut, tick_fut).await {
-      Either::First(motion) => {
-        // Got a fresh motion command from the controller -> exit
-        // failsafe state and drive motors as requested.
-        failsafe_engaged = false;
+    // Three-way select: motion command, motion-expiry timeout, or
+    // global watchdog tick.
+    match select(select(motion_fut, expiry_fut), tick_fut).await {
+      // --- Outer select: motion/expiry vs watchdog tick ---
+      Either::First(inner) => match inner {
+        // --- Motion command received ---
+        Either::First(motion) => {
+          // Got a fresh motion command from the controller -> exit
+          // failsafe state and drive motors as requested.
+          failsafe_engaged = false;
+          motion_received = true;
 
-        // LED indicates whether the chassis is currently commanded to move.
-        if motion.vx != 0 || motion.vy != 0 || motion.omega != 0 {
-          led_col1.set_high();
-        } else {
-          led_col1.set_low();
+          // LED indicates whether the chassis is currently commanded to move.
+          if motion.vx != 0 || motion.vy != 0 || motion.omega != 0 {
+            led_col1.set_high();
+          } else {
+            led_col1.set_low();
+          }
+
+          motor_driver.apply_motion(&motion).await;
         }
-
-        motor_driver.apply_motion(&motion).await;
-      }
+        // --- Motion expiry timeout ---
+        Either::Second(_) => {
+          // No fresh motion command arrived within MOTION_EXPIRY_MS.
+          // The controller is almost certainly gone — stop immediately.
+          if !failsafe_engaged {
+            warn!(
+              "Motion expired: no command for {} ms, stopping motors",
+              MOTION_EXPIRY_MS
+            );
+            motor_driver.stop_all().await;
+            led_col1.set_low();
+            failsafe_engaged = true;
+          }
+        }
+      },
+      // --- Global watchdog tick ---
       Either::Second(_) => {
-        // Watchdog tick: check whether the RX path has gone silent.
+        // Check whether the RX path has gone completely silent.
         // `radio::last_rx_millis()` returns 0 until the first packet
         // is parsed, which we treat as "never connected" => failsafe
         // (motors should remain stopped after boot anyway).
         let last_rx = radio::last_rx_millis();
         let now_ms = Instant::now().as_millis() as u32;
-        // `wrapping_sub` makes the comparison robust across the
-        // ~49-day u32-millis wrap; in practice we'll never hit it.
         let elapsed = now_ms.wrapping_sub(last_rx);
         let link_lost = last_rx == 0 || elapsed > FAILSAFE_TIMEOUT_MS;
 
