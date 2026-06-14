@@ -1,5 +1,7 @@
 # microbit-car
 
+[中文版本](README_zh.md) | [English Version](README.md)
+
 A wireless **Mecanum-wheel omnidirectional car** built around two
 [BBC micro:bit v2] boards (nRF52833) and written in **`#![no_std]` async Rust**
 on top of the [Embassy] runtime.
@@ -39,6 +41,8 @@ phone needed.
   - [Diagnostic mode](#diagnostic-mode)
   - [Failsafe behaviour](#failsafe-behaviour)
   - [Hardware quirks (buzzer \& PWM carrier)](#hardware-quirks-buzzer--pwm-carrier)
+    - [1. Buzzer line held low at boot (`P0_02`)](#1-buzzer-line-held-low-at-boot-p0_02)
+    - [2. PCA9685 carrier at 1.5 kHz, not 50 Hz](#2-pca9685-carrier-at-15-khz-not-50-hz)
   - [Pin map (cheat-sheet)](#pin-map-cheat-sheet)
     - [Controller (micro:bit v2)](#controller-microbit-v2)
     - [Car (micro:bit v2 + MotorBit shield)](#car-microbit-v2--motorbit-shield)
