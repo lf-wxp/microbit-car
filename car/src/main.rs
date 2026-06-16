@@ -2,6 +2,7 @@
 #![no_main]
 
 mod diagnostic;
+mod light;
 mod motor;
 mod motorbit;
 mod pca9685;
@@ -121,6 +122,10 @@ async fn main(spawner: Spawner) {
 
   info!("Motor driver initialized, entering main loop");
 
+  // Initialize the light
+
+  let mut light = light::init(p.P0_17, p.P0_13);
+
   // Tracks whether failsafe has already forced a stop, so we don't
   // hammer the I2C bus restating "all motors off" every tick.
   // Reset to `false` on every successful motion command.
@@ -167,8 +172,10 @@ async fn main(spawner: Spawner) {
           // LED indicates whether the chassis is currently commanded to move.
           if motion.vx != 0 || motion.vy != 0 || motion.omega != 0 {
             led_col1.set_high();
+            light.light_off();
           } else {
             led_col1.set_low();
+            light.light_on();
           }
 
           motor_driver.apply_motion(&motion).await;
