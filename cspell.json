@@ -10,6 +10,7 @@
 		"crcinit",
 		"crcpoly",
 		"datawhiteiv",
+		"DEADZONE",
 		"defmt",
 		"eabihf",
 		"framestart",

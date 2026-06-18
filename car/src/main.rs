@@ -8,6 +8,7 @@ mod motor;
 mod motorbit;
 mod pca9685;
 mod radio;
+mod rgb;
 
 use defmt_rtt as _;
 use panic_probe as _;
@@ -101,6 +102,13 @@ async fn main(spawner: Spawner) {
   );
   spawner.spawn(display::display_task(matrix).unwrap());
 
+  // Initialize the 4-LED WS2812 RGB strip on edge-connector P16 (P1_02).
+  // Start with everything off; the main loop will drive the colors
+  // based on motion state below.
+  let mut rgb_strip = rgb::init(p.P1_02);
+  rgb_strip.clear();
+  rgb_strip.show();
+
   info!("Car firmware started");
 
   // Sample the on-board A button (P0_14) *before* anything else so the
@@ -114,6 +122,10 @@ async fn main(spawner: Spawner) {
     let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
     // Light up the matrix to indicate diagnostic mode is active.
     let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::forward(100));
+    // Solid cyan on the RGB strip is an unmistakable "diagnostic mode"
+    // marker that doesn't depend on the LED matrix being visible.
+    rgb_strip.set_all(rgb::Color::CYAN);
+    rgb_strip.show();
     diagnostic::run(&mut motor_driver).await;
   }
 
@@ -186,6 +198,16 @@ async fn main(spawner: Spawner) {
             light.light_on();
           }
 
+          // Drive the 4 RGB LEDs from the motion vector so the operator
+          // gets a quick visual confirmation of the current command:
+          //   * stopped         -> dim white
+          //   * forward / back  -> green / red
+          //   * strafe L / R    -> blue / yellow
+          //   * spin in place   -> magenta
+          let rgb_color = motion_to_rgb(&motion);
+          rgb_strip.set_all(rgb_color);
+          rgb_strip.show();
+
           motor_driver.apply_motion(&motion).await;
         }
         // --- Motion expiry timeout ---
@@ -200,6 +222,9 @@ async fn main(spawner: Spawner) {
             motor_driver.stop_all().await;
             // Show idle pattern on the LED matrix.
             let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::stop());
+            // Signal failsafe via the RGB strip too (dim red).
+            rgb_strip.set_all(rgb::Color::new(32, 0, 0));
+            rgb_strip.show();
             failsafe_engaged = true;
           }
         }
@@ -223,9 +248,61 @@ async fn main(spawner: Spawner) {
           motor_driver.stop_all().await;
           // Show idle pattern on the LED matrix.
           let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::stop());
+          // Signal link-loss failsafe on the RGB strip (dim red).
+          rgb_strip.set_all(rgb::Color::new(32, 0, 0));
+          rgb_strip.show();
           failsafe_engaged = true;
         }
       }
     }
+  }
+}
+
+/// Map a [`MotionPayload`] to a single status color for the RGB strip.
+///
+/// The strip is purely informational, so we collapse the 3-axis vector
+/// down to one of a small palette of easily distinguishable colors:
+///
+/// * idle              -> dim white
+/// * forward dominant  -> green
+/// * backward dominant -> red
+/// * strafe right      -> yellow
+/// * strafe left       -> blue
+/// * pure rotation     -> magenta
+///
+/// Threshold of 10 matches the controller's joystick dead-zone so a
+/// centred stick consistently shows the idle color.
+fn motion_to_rgb(motion: &protocol::MotionPayload) -> rgb::Color {
+  const DEADZONE: i8 = 10;
+  let vx = motion.vx;
+  let vy = motion.vy;
+  let omega = motion.omega;
+
+  let abs_vx = vx.unsigned_abs() as i16;
+  let abs_vy = vy.unsigned_abs() as i16;
+  let abs_omega = omega.unsigned_abs() as i16;
+
+  // Idle: every axis is within the dead-zone.
+  if abs_vx < DEADZONE as i16 && abs_vy < DEADZONE as i16 && abs_omega < DEADZONE as i16 {
+    return rgb::Color::new(16, 16, 16);
+  }
+
+  // Pick the dominant axis. Translation wins ties against rotation so
+  // that mostly-driving commands don't flicker to magenta on small yaw.
+  let max_lin = abs_vx.max(abs_vy);
+  if abs_omega > max_lin {
+    return rgb::Color::MAGENTA;
+  }
+
+  if abs_vx >= abs_vy {
+    if vx >= 0 {
+      rgb::Color::GREEN
+    } else {
+      rgb::Color::RED
+    }
+  } else if vy >= 0 {
+    rgb::Color::YELLOW
+  } else {
+    rgb::Color::BLUE
   }
 }

@@ -91,7 +91,9 @@ microbit-car/
 ├── memory.x（每个 crate） # 链接器内存布局
 │
 ├── protocol/           # #![no_std] 线格式 crate（两侧共享）
-│   └── src/lib.rs      # MessageType, RadioPacket, MotionPayload, ...
+│   └── src/
+│       ├── lib.rs      # MessageType, RadioPacket, MotionPayload, ...
+│       └── display.rs  # 共享的 5×5 LED 矩阵渲染器（控制器与小车共用）
 │
 ├── radio-core/         # #![no_std] 共享无线电配置 + TX/RX 辅助函数
 │   └── src/lib.rs      # init(), send_packet*, 重试策略, 通道号 #, ...
@@ -104,14 +106,17 @@ microbit-car/
 │       ├── tilt.rs     # LSM303AGR 加速度计驱动，倾斜 → vx/vy
 │       ├── button.rs   # C/D 欧米伽按钮 + A 模式切换按钮
 │       ├── mode.rs     # 输入模式仲裁（Joystick ⇄ Tilt）通过 atomic + Signal
-│       ├── display.rs  # 5×5 LED 矩阵指示器（运动方向）
+│       ├── display.rs  # 基于 `protocol::display` 的 5×5 LED 矩阵薄封装
 │       └── rgb.rs      # 扩展板上 4× WS2812 状态 LED（P8，LED0 显示链路状态）
 │
 ├── car/                # 小车固件（二进制 crate）
     └── src/
-        ├── main.rs        # Embassy `main`，电机驱动 + 无线电 RX 胶水代码 + RX 故障安全
+        ├── main.rs        # Embassy `main`，电机驱动 + 无线电 RX + 双层故障安全
         ├── radio.rs       # 802.15.4 RX 任务，分发 Motion / E-Stop / HB
         ├── diagnostic.rs  # 启动时 A 按钮电机接线扫描（M1→M2→M3→M4）
+        ├── display.rs     # 板载 5×5 LED 矩阵任务（实时显示运动方向）
+        ├── light.rs       # 底盘左右两侧的状态 LED（停止时点亮，运动时熄灭）
+        ├── rgb.rs         # 边缘连接器 P16 上的 4× WS2812 全彩灯（按运动状态着色）
         ├── motor.rs       # MotorDriver：麦克纳姆逆运动学 + I²C 初始化
         ├── motorbit.rs    # MotorBit 扩展板抽象（4 直流电机 + 8 伺服）
         └── pca9685.rs     # 底层 PCA9685 PWM 驱动（载波 @ 1.5 kHz）
@@ -347,7 +352,7 @@ LED 1–3 保持空白，但驱动程序始终移位出所有四个像素（WS28
 
 ## 小车设计
 
-`car/src/main.rs` 刻意保持精简：
+`car/src/main.rs` 刻意保持精简，但除了驱动电机之外还会同时驱动三条并行的反馈通道：板载 **5×5 LED 矩阵**（运动方向）、**底盘状态 LED**（左 + 右，停止时点亮），以及**边缘连接器 P16 上的 4 颗 WS2812 RGB 全彩灯**（按运动状态显示不同颜色）。
 
 ```rust
 // 启动时将引脚 P0_02 拉低以静音板载蜂鸣器线路
@@ -355,29 +360,65 @@ LED 1–3 保持空白，但驱动程序始终移位出所有四个像素（WS28
 // "硬件注意事项" 下方）。
 let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
 
+// 5×5 LED 矩阵任务：将运动向量映射为方向箭头实时显示。
+let matrix = display::init(/* ROW1..ROW5, COL1..COL5 */);
+spawner.spawn(display::display_task(matrix).unwrap());
+
+// P16 (P1_02) 上的 4 颗 WS2812 RGB 全彩灯：每种运动状态对应一个颜色。
+let mut rgb_strip = rgb::init(p.P1_02);
+rgb_strip.clear();
+rgb_strip.show();
+
 // 可选：在上电后前 2 秒内点击 A 按钮（P0_14）
 // 进入电机接线诊断模式，而不是正常的无线电循环。
 if diagnostic::is_diagnostic_requested(p.P0_14).await {
     let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
+    rgb_strip.set_all(rgb::Color::CYAN); rgb_strip.show(); // 诊断模式标记
     diagnostic::run(&mut motor_driver).await; // -> !
 }
 
 let radio = radio::init(p.RADIO);
 spawner.spawn(radio::radio_rx_task(radio).unwrap());
 let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
+let mut light = light::init(p.P0_17, p.P0_13); // 底盘状态 LED
 
+// 双层链路丢失保护（参见 "故障安全行为"）：
+//   1. 单包过期定时器（~60 ms）—— 主路径，响应快。
+//   2. 全局看门狗滴答（~200 ms）—— 兜底路径，捕获
+//      运动通道整体卡死的情况。
 loop {
-    // 在新鲜运动数据包和 100 ms 看门狗滴答之间进行 `select`，
-    // 以强制执行链路丢失故障安全（参见 "故障安全行为"）。
-    match select(radio::MOTION_CHANNEL.receive(), Timer::after_millis(100)).await {
-        Either::First(motion) => motor_driver.apply_motion(&motion).await,
-        Either::Second(_)     => check_failsafe_and_maybe_stop(&mut motor_driver).await,
+    match select(select(motion_fut, expiry_fut), watchdog_tick).await {
+        // ─── 收到新的运动指令 ───
+        Either::First(Either::First(motion)) => {
+            display::DISPLAY_CHANNEL.try_send(motion).ok();
+            if motion.is_zero() { light.light_on(); } else { light.light_off(); }
+            rgb_strip.set_all(motion_to_rgb(&motion));
+            rgb_strip.show();
+            motor_driver.apply_motion(&motion).await;
+        }
+        // ─── 运动指令过期（≥ 60 ms 未收到新指令） ───
+        Either::First(Either::Second(_)) => {
+            motor_driver.stop_all().await;
+            rgb_strip.set_all(rgb::Color::new(32, 0, 0)); // 暗红色
+            rgb_strip.show();
+        }
+        // ─── 全局看门狗滴答（任何类型的数据包都没有 ≥ 200 ms） ───
+        Either::Second(_) => failsafe_if_link_lost(&mut motor_driver, &mut rgb_strip).await,
     }
 }
 ```
 
 - **`radio::radio_rx_task`** 验证版本，按 `MessageType` 分发，ACK `Heartbeat` 和 `EmergencyStop`，并将成功解析的 `MotionPayload` 推送到 `MOTION_CHANNEL`。**它不会 ACK `Motion`**——参见[消息类型](#消息类型)下的 "ACK 策略" 说明。
 - **`MotorDriver::apply_motion`** 运行逆运动学，归一化，将 `[-100..100]` 缩放到 `[-4095..4095]`，然后通过 `MotorBit` → `PCA9685` 堆栈驱动 M1–M4。
+- **`display::display_task`** 在独立任务中运行，从 `Channel` 中消费 `MotionPayload`，多路扫描 5×5 LED 矩阵以绘制与当前方向相符的箭头。渲染器本身位于 [`protocol/src/display.rs`](protocol/src/display.rs)，从而被控制器和小车两侧复用。
+- **`light::Light`** 是对底盘两侧状态 LED（左 P0_17、右 P0_13，低电平点亮）的轻量 GPIO 封装。主循环在**运动向量为零时点亮**它们，运动时熄灭，从而提供一个隔着房间也能看清的 "我已停下 / 我在移动" 视觉提示。
+- **`rgb::RgbStrip`** 在临界区中以位翻转方式驱动 P16 (`P1_02`) 上的 4 颗 WS2812，确保中断延迟不会破坏 800 kHz 的时序。主循环通过 `motion_to_rgb` 把每个运动向量映射成单一颜色：
+  - 暗白 = 静止（所有轴都在死区内），
+  - 绿 / 红 = 主要前进 / 后退，
+  - 蓝 / 黄 = 左 / 右横移为主，
+  - 品红 = 纯旋转，
+  - 暗红 = 故障安全（链路断开或运动指令过期），
+  - 实色青 = 诊断模式。
 - `MotorBit` 抽象还公开了 `set_servo_angle` / `set_servo_duty`（用于 S1–S8），因此添加云台/倾斜摄像头或机械爪只需要获取 `motor_driver.twim_mut()` 并实例化 `Pca9685::resume(...)` + `MotorBit::new(...)` 对。
 
 ---
@@ -409,16 +450,17 @@ loop {
 
 ## 故障安全行为
 
-小车的主循环对与控制器失去联系的情况非常警惕。两个独立的超时协同工作：
+小车的主循环对与控制器失去联系的情况非常警惕。**三层**独立的超时协同工作——小车上两层、控制器上一层：
 
-| 层       | 位置                          | 触发                                                 | 操作                                  |
-|-------------|--------------------------------|---------------------------------------------------------|-----------------------------------------|
-| 应用 | `car/src/main.rs`              | 在 `FAILSAFE_TIMEOUT_MS`（= 500 ms）内没有任何类型的数据包传入 | `MotorDriver::stop_all()`，状态 LED 熄灭 |
-| 链路        | `controller/src/radio.rs`      | 在 `HEARTBEAT_TIMEOUT_MS`（= 600 ms）内没有 `Heartbeat` 回复 | 控制器上的 RGB LED0 变为红色   |
+| 层级                     | 位置                          | 触发                                                                                       | 操作                                                              |
+|--------------------------|--------------------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------------------|
+| 单包过期（主路径，快）   | `car/src/main.rs`             | 在 `MOTION_EXPIRY_MS`（= 60 ms，约等于丢失 3 帧运动数据）内没有新的 `Motion` 数据包      | `MotorDriver::stop_all()`，RGB 灯条变暗红，矩阵切到空闲图案     |
+| 全局看门狗（兜底路径）   | `car/src/main.rs`             | 在 `FAILSAFE_TIMEOUT_MS`（= 200 ms）内没有任何类型的数据包传入                             | 同上；专门用来兜底捕获运动通道本身被卡死的情况                  |
+| 链路状态（界面提示）     | `controller/src/radio.rs`     | 在 `HEARTBEAT_TIMEOUT_MS`（= 600 ms）内没有 `Heartbeat` 回复                              | 控制器上的 RGB LED0 变为红色                                    |
 
-因为心跳以 ~5 Hz（每 200 ms）到达，而运动以 ~50 Hz 到达，500 ms 的静默是一个舒适的余量：单个丢失的帧不会被注意到，三个丢失的心跳会停止小车。看门狗使用 `Instant::now()` 对抗 `radio::last_rx_millis()`，后者在*每个*成功解析的数据包上更新——Motion、Heartbeat 或 E-Stop——因此即使控制器正在发送没有运动的心跳，链路仍然被认为是活动的。
+单包过期路径是**主**链路丢失检测器，因为它直接耦合在 50 Hz 运动流上——满速行驶时最坏情况下的 "幽灵滑行" 现在只有几厘米，远低于早期版本约 250 ms 可感知的漂移。200 ms 的全局看门狗作为兜底并行运行：它对 `radio::last_rx_millis()` 进行轮询（该值在**每一个**成功解析的数据包上都会更新——Motion、Heartbeat 或 E-Stop），即使运动通道本身已经停止投递，这条路径仍然会触发。
 
-故障安全状态**保持粘性直到清除**：一旦启动，小车保持停止状态（我们不会每 100 ms 敲 I²C 总线重新声明 "所有电机关闭"）直到新数据包到达，此时循环正常恢复。启动也算作故障安全（`last_rx == 0`），因此在上电无线电链路之前，轮子永远不会旋转。
+故障安全状态在小车上**保持粘性直到被清除**：一旦启动，电机保持停止状态（我们不会每个滴答都敲一次 I²C 总线重申 "所有电机关闭"）直到下一个有效数据包到达，此时主循环正常恢复。启动也算作故障安全（`motion_received == false`），因此在无线电链路启动**且**收到一条非零运动指令之前，轮子永远不会旋转。
 
 ---
 
@@ -473,12 +515,16 @@ let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
 | I²C SDA → PCA9685              | **P20**        | `P1.00`       | TWIM0                                          |
 | **A 按钮**（诊断模式） | 板载       | `P0.14`       | 低电平有效，内部 `Pull::Up`；在启动后 2 秒内点击 |
 | **蜂鸣器线路**（保持低电平）     | **P0**         | `P0.02`       | GPIO 输出低；静音 MotorBit 蜂鸣器      |
+| **WS2812 RGB 灯条**（×4）      | **P16**        | `P1.02`       | 位翻转 ~800 kHz 驱动，按运动状态着色             |
+| **左侧状态 LED**               | **P1**         | `P0.17`       | GPIO 输出，低电平有效；停止时点亮                  |
+| **右侧状态 LED**               | **P2**         | `P0.13`       | GPIO 输出，低电平有效；停止时点亮                  |
+| 5×5 LED 矩阵 ROW1..ROW5        | 板载            | `P0.21`/`P0.22`/`P0.15`/`P0.24`/`P0.19` | GPIO 输出，由 `display_task` 多路复用扫描 |
+| 5×5 LED 矩阵 COL1..COL5        | 板载            | `P0.28`/`P0.11`/`P0.31`/`P1.05`/`P0.30` | GPIO 输出，低电平有效                |
 | PCA9685 通道 CH0/CH1       | （在扩展板上）    | —             | 电机 M1（FL）+/- 端子                    |
 | PCA9685 通道 CH2/CH3       | （在扩展板上）    | —             | 电机 M2（FR）+/- 端子                    |
 | PCA9685 通道 CH4/CH5       | （在扩展板上）    | —             | 电机 M3（RL）+/- 端子                    |
 | PCA9685 通道 CH6/CH7       | （在扩展板上）    | —             | 电机 M4（RR）+/- 端子                    |
 | PCA9685 通道 CH8..CH15     | （在扩展板上）    | —             | 伺服接头 S1..S8（50 Hz **未**激活——参见硬件注意事项） |
-| 状态 LED                     | row1/col1      | `P0.21`/`P0.28`| 当运动 ≠ 0 时点亮，或在诊断模式下常亮 |
 
 > **轮子布局（顶视图，电机 → 角落映射）：** `M1 = 左前`，`M2 = 右前`，`M3 = 左后`，`M4 = 右后`。如果您的底盘旋转或横向移动方向错误，最简单的修复方法是交换有问题电机的两个端子——无需更改代码。
 
@@ -561,7 +607,7 @@ cargo make clean              # cargo clean
    - C + D → 将旋转立即归零。
 7. **右摇杆（计划中，可选）。** 稍后可以连接第二个模拟摇杆以提供连续的 `omega` 控制。固件已经针对模拟源完整运行管道；启用 Cargo 功能 `right-stick-hw` 并在硬件就绪后完成 `controller/src/joystick_right.rs` 中的构造函数。然后右摇杆和 C/D 按钮**求和并钳位到 ±100**，因此按钮充当摇杆之上的精细微调。
 8. 松开所有输入立即发送 `(0, 0, 0)`；小车停止。
-9. 如果小车在 `FAILSAFE_TIMEOUT_MS`（500 ms，参见[故障安全行为](#故障安全行为)）内停止从控制器接收信号，它也会自行停止。控制器反过来在 `HEARTBEAT_TIMEOUT_MS`（600 ms）后将其 RGB 指示器翻转为红色，因此您在 wondering 为什么小车停止响应之前获得控制器上的视觉提示，即链路已断开。
+9. 如果小车在 `MOTION_EXPIRY_MS`（60 ms，约等于丢失 3 帧运动数据）内没有再收到运动指令，或在 `FAILSAFE_TIMEOUT_MS`（200 ms）内完全没有任何无线电数据，它都会自行停止（参见[故障安全行为](#故障安全行为)）。一旦故障安全启动，**P16 上的 RGB 灯条会变成暗红色**。控制器侧也会在 `HEARTBEAT_TIMEOUT_MS`（600 ms）后将其扩展板上的 RGB LED0 翻转为红色，因此**两块板上**都会有视觉提示告诉您链路已断开，无需再去猜测小车为何停下。
 
 ---
 
@@ -587,7 +633,7 @@ cargo make clean              # cargo clean
 | 侧向推动摇杆时旋转而不是横向移动           | 两个对角相对的轮子反转                                                   | 从 `defmt` 电机日志中识别该对并翻转两者                                                                          |
 | 松开摇杆后小车继续蠕动                       | 摇杆中心偏移（制造公差）并超过 `DEAD_ZONE`                   | 增加 `controller/src/joystick.rs` 中的 `DEAD_ZONE`（尝试 `40`）                                                                      |
 | 倾斜模式感觉太敏感 / 不够敏感                   | `FULL_TILT` 与您实际倾斜的程度不匹配                                           | 调整 `controller/src/tilt.rs` 中的 `FULL_TILT` 和 `DEAD_ZONE`                                                                        |
-| 即使按住摇杆，小车也每隔 ~500 ms 停止一次                       | 故障安全触发——控制器→小车链路正在丢包                                     | 将开发板移近，更改 `RADIO_CHANNEL`，提高 `radio-core/src/lib.rs` 中的 `TX_POWER`，或放宽 `car/src/main.rs` 中的 `FAILSAFE_TIMEOUT_MS` |
+| 即使按住摇杆，小车也每隔 ~60 ms 停止一次（RGB 灯条变暗红）       | 单包过期故障安全触发——控制器→小车链路正在丢包                                | 将开发板移近，更改 `RADIO_CHANNEL`，提高 `radio-core/src/lib.rs` 中的 `TX_POWER`，或放宽 `car/src/main.rs` 中的 `MOTION_EXPIRY_MS` / `FAILSAFE_TIMEOUT_MS` |
 | 小车旋转 / 横向移动错误，但您无法判断哪个轮子有故障  | 在摇杆控制下很难诊断                                                       | 断电并在 2 秒内点击**A 按钮**以进入[诊断模式](#诊断模式)，然后观察哪个轮子转动      |
 | 即使静止时底盘也有连续的低嗡嗡声 / 哼声                | PCA9685 载波恢复为 50 Hz，或蜂鸣器开关打开时 `P0_02` 保持浮动         | 验证 `car/src/pca9685.rs` 中的 `DEFAULT_PWM_FREQ_HZ = 1500`，以及 `main.rs` 中仍然有 `Output::new(p.P0_02, Level::Low, ...)`（参见[硬件注意事项](#硬件注意事项蜂鸣器与-pwm-载波)） |
 | `cargo build` 失败，显示 **"未找到目标 'thumbv7em-none-eabihf'"** | 缺少交叉编译目标                                                                  | `rustup target add thumbv7em-none-eabihf`                                                                                            |

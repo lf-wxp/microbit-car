@@ -100,7 +100,9 @@ microbit-car/
 ├── memory.x (per crate) # Linker memory layout
 │
 ├── protocol/           # #![no_std] wire-format crate (shared by both sides)
-│   └── src/lib.rs      # MessageType, RadioPacket, MotionPayload, ...
+│   └── src/
+│       ├── lib.rs      # MessageType, RadioPacket, MotionPayload, ...
+│       └── display.rs  # Shared 5×5 LED matrix renderer (used by both sides)
 │
 ├── radio-core/         # #![no_std] shared radio config + TX/RX helpers
 │   └── src/lib.rs      # init(), send_packet*, retry policy, channel #, ...
@@ -113,14 +115,17 @@ microbit-car/
 │       ├── tilt.rs     # LSM303AGR accelerometer driver, tilt → vx/vy
 │       ├── button.rs   # C/D omega buttons + A mode-toggle button
 │       ├── mode.rs     # InputMode arbitration (Joystick ⇄ Tilt) via atomic + Signal
-│       ├── display.rs  # 5×5 LED matrix indicator (motion direction)
+│       ├── display.rs  # Thin wrapper over `protocol::display` for the 5×5 LED matrix
 │       └── rgb.rs      # 4× WS2812 status LEDs on P8 (link state on LED0)
 │
 ├── car/                # Car firmware (binary crate)
     └── src/
-        ├── main.rs        # Embassy `main`, motor driver + radio RX glue + RX failsafe
+        ├── main.rs        # Embassy `main`, motor driver + radio RX glue + dual-layer failsafe
         ├── radio.rs       # 802.15.4 RX task, dispatches Motion / E-Stop / HB
         ├── diagnostic.rs  # Boot-time A-button motor wiring sweep (M1→M2→M3→M4)
+        ├── display.rs     # On-board 5×5 LED matrix task (mirrors motion direction)
+        ├── light.rs       # Left/right chassis status LEDs (on when stopped, off when moving)
+        ├── rgb.rs         # 4× WS2812 RGB strip on edge-connector P16 (motion-state colour)
         ├── motor.rs       # MotorDriver: Mecanum inverse kinematics + I²C init
         ├── motorbit.rs    # MotorBit shield abstraction (4 DC motors + 8 servos)
         └── pca9685.rs     # Low-level PCA9685 PWM driver (carrier @ 1.5 kHz)
@@ -413,7 +418,11 @@ render-side change: extend [`RgbState`](controller/src/rgb.rs) and the
 
 ## Car design
 
-`car/src/main.rs` keeps things deliberately small:
+`car/src/main.rs` keeps things deliberately small but now drives three
+parallel feedback channels in addition to the motors: the on-board
+**5×5 LED matrix** (motion direction), the **chassis status LEDs**
+(left + right, on when stopped) and the **4-LED WS2812 RGB strip on
+edge-connector P16** (motion-state colour).
 
 ```rust
 // Pin P0_02 low at boot to silence the on-board buzzer line
@@ -421,23 +430,50 @@ render-side change: extend [`RgbState`](controller/src/rgb.rs) and the
 // "Hardware quirks" below).
 let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
 
+// 5×5 LED matrix task: mirrors the motion vector as a directional arrow.
+let matrix = display::init(/* ROW1..ROW5, COL1..COL5 */);
+spawner.spawn(display::display_task(matrix).unwrap());
+
+// 4-LED WS2812 strip on P16 (P1_02): single colour per motion state.
+let mut rgb_strip = rgb::init(p.P1_02);
+rgb_strip.clear();
+rgb_strip.show();
+
 // Optional: tap the A button (P0_14) within the first 2 s to enter
 // the motor wiring diagnostic instead of the normal radio loop.
 if diagnostic::is_diagnostic_requested(p.P0_14).await {
     let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
+    rgb_strip.set_all(rgb::Color::CYAN); rgb_strip.show(); // diagnostic marker
     diagnostic::run(&mut motor_driver).await; // -> !
 }
 
 let radio = radio::init(p.RADIO);
 spawner.spawn(radio::radio_rx_task(radio).unwrap());
 let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
+let mut light = light::init(p.P0_17, p.P0_13); // chassis status LEDs
 
+// Two-layer link-loss protection (see "Failsafe behaviour"):
+//   1. Per-motion expiry timer (~60 ms) — primary, fast path.
+//   2. Global watchdog tick    (~200 ms) — secondary, catches a
+//      wedged motion channel.
 loop {
-    // `select` between a fresh motion packet and a 100 ms watchdog tick
-    // that enforces the link-loss failsafe (see "Failsafe behaviour").
-    match select(radio::MOTION_CHANNEL.receive(), Timer::after_millis(100)).await {
-        Either::First(motion) => motor_driver.apply_motion(&motion).await,
-        Either::Second(_)     => check_failsafe_and_maybe_stop(&mut motor_driver).await,
+    match select(select(motion_fut, expiry_fut), watchdog_tick).await {
+        // ─── Motion command received ───
+        Either::First(Either::First(motion)) => {
+            display::DISPLAY_CHANNEL.try_send(motion).ok();
+            if motion.is_zero() { light.light_on(); } else { light.light_off(); }
+            rgb_strip.set_all(motion_to_rgb(&motion));
+            rgb_strip.show();
+            motor_driver.apply_motion(&motion).await;
+        }
+        // ─── Motion expired (≥ 60 ms with no fresh command) ───
+        Either::First(Either::Second(_)) => {
+            motor_driver.stop_all().await;
+            rgb_strip.set_all(rgb::Color::new(32, 0, 0)); // dim red
+            rgb_strip.show();
+        }
+        // ─── Global watchdog tick (no RX of any kind ≥ 200 ms) ───
+        Either::Second(_) => failsafe_if_link_lost(&mut motor_driver, &mut rgb_strip).await,
     }
 }
 ```
@@ -450,6 +486,25 @@ loop {
 - **`MotorDriver::apply_motion`** runs the inverse kinematics, normalises,
   scales `[-100..100]` to `[-4095..4095]`, then drives M1–M4 via the
   `MotorBit` → `PCA9685` stack.
+- **`display::display_task`** runs in its own task and consumes
+  `MotionPayload`s from a `Channel`, multiplexing the 5×5 LED matrix to
+  draw an arrow that matches the current direction. The renderer itself
+  lives in [`protocol/src/display.rs`](protocol/src/display.rs) so the
+  controller and the car can share it.
+- **`light::Light`** is a thin GPIO wrapper around the two chassis-side
+  status LEDs (P0_17 left, P0_13 active-low). The main loop turns them
+  **on when the motion vector is zero** and off otherwise, giving a
+  visible "I'm stopped / I'm moving" cue from across the room.
+- **`rgb::RgbStrip`** bit-bangs four WS2812 LEDs on P16 (`P1_02`) inside
+  a critical section so interrupt latency cannot break the 800 kHz
+  line. The main loop maps each motion vector to a single colour via
+  `motion_to_rgb`:
+  - dim white = idle (all axes inside the dead-zone),
+  - green / red = forward / backward dominant,
+  - blue / yellow = strafe left / right,
+  - magenta = pure rotation,
+  - dim red = failsafe (link lost or motion expired),
+  - solid cyan = diagnostic mode.
 - The `MotorBit` abstraction also exposes `set_servo_angle` /
   `set_servo_duty` for S1–S8, so adding a pan/tilt camera or a gripper is
   just a matter of grabbing `motor_driver.twim_mut()` and instantiating
@@ -497,26 +552,30 @@ See [`car/src/diagnostic.rs`](car/src/diagnostic.rs) for the source.
 ## Failsafe behaviour
 
 The car's main loop is paranoid about losing contact with the
-controller. Two independent timeouts cooperate:
+controller. **Three** independent timeouts cooperate, two on the car
+and one on the controller:
 
-| Layer       | Where                          | Trigger                                                 | Action                                  |
-|-------------|--------------------------------|---------------------------------------------------------|-----------------------------------------|
-| Application | `car/src/main.rs`              | No inbound packet of *any* kind for `FAILSAFE_TIMEOUT_MS` (= 500 ms) | `MotorDriver::stop_all()`, status LED off |
-| Link        | `controller/src/radio.rs`      | No `Heartbeat` reply for `HEARTBEAT_TIMEOUT_MS` (= 600 ms) | RGB LED0 turns red on the controller   |
+| Layer       | Where                          | Trigger                                                                                | Action                                                  |
+|-------------|--------------------------------|----------------------------------------------------------------------------------------|---------------------------------------------------------|
+| Motion expiry (primary, fast) | `car/src/main.rs`     | No fresh `Motion` packet for `MOTION_EXPIRY_MS` (= 60 ms, ≈ 3 missed motion frames)    | `MotorDriver::stop_all()`, RGB strip → dim red, matrix → idle |
+| Global watchdog (secondary)   | `car/src/main.rs`     | No inbound packet of *any* kind for `FAILSAFE_TIMEOUT_MS` (= 200 ms)                   | Same as above; catches the case where the motion channel itself is wedged |
+| Link state (UI cue)           | `controller/src/radio.rs` | No `Heartbeat` reply for `HEARTBEAT_TIMEOUT_MS` (= 600 ms)                          | RGB LED0 turns red on the controller                    |
 
-Because heartbeats arrive at ~5 Hz (every 200 ms) and motion at ~50 Hz,
-500 ms of silence is a comfortable margin: a single dropped frame is
-unnoticeable, three missed heartbeats stop the car. The watchdog uses
-`Instant::now()` against `radio::last_rx_millis()`, which is updated on
-*every* successfully parsed packet — Motion, Heartbeat or E-Stop — so
-even if the controller is sending heartbeats with no motion the link
-is still considered alive.
+The motion-expiry path is the **primary** link-loss detector because it
+is directly coupled to the 50 Hz motion stream — at full speed the
+worst-case "ghost roll" is now only a few centimetres, well below the
+~250 ms perceptible drift older versions exhibited. The 200 ms global
+watchdog runs alongside as belt-and-braces: it polls
+`radio::last_rx_millis()` (updated on **every** successfully parsed
+packet — Motion, Heartbeat or E-Stop) so it still fires even if the
+motion channel itself has somehow stopped delivering.
 
-Failsafe state is **sticky-until-cleared**: once engaged, the car stays
-stopped (and we don't hammer the I²C bus restating "all motors off"
-every 100 ms) until a new packet arrives, at which point the loop
-resumes normally. Boot also counts as failsafe (`last_rx == 0`), so
-the wheels never spin until the radio link is up.
+Failsafe state is **sticky-until-cleared** on the car: once engaged,
+the motors stay stopped (and we don't hammer the I²C bus restating
+"all motors off" every tick) until the next valid packet arrives, at
+which point the loop resumes normally. Boot also counts as failsafe
+(`motion_received == false`), so the wheels never spin until the radio
+link is up *and* a non-zero motion command has been received.
 
 ---
 
@@ -591,12 +650,16 @@ put servos on a separate driver) — most hobby servos won't tolerate
 | I²C SDA → PCA9685              | **P20**        | `P1.00`       | TWIM0                                          |
 | **A button** (diagnostic mode) | on-board       | `P0.14`       | Active-low, internal `Pull::Up`; tap within 2 s of boot |
 | **Buzzer line** (held low)     | **P0**         | `P0.02`       | GPIO Output Low; silences MotorBit buzzer      |
+| **WS2812 RGB strip** (×4)      | **P16**        | `P1.02`       | Bit-banged ~800 kHz, motion-state colour       |
+| **Left status LED**            | **P1**         | `P0.17`       | GPIO Output, active-low; on when stopped       |
+| **Right status LED**           | **P2**         | `P0.13`       | GPIO Output, active-low; on when stopped       |
+| 5×5 LED matrix ROW1..ROW5      | on-board       | `P0.21`/`P0.22`/`P0.15`/`P0.24`/`P0.19` | GPIO Output, multiplexed by `display_task` |
+| 5×5 LED matrix COL1..COL5      | on-board       | `P0.28`/`P0.11`/`P0.31`/`P1.05`/`P0.30` | GPIO Output, active-low                |
 | PCA9685 channels CH0/CH1       | (on shield)    | —             | Motor M1 (FL) +/- terminals                    |
 | PCA9685 channels CH2/CH3       | (on shield)    | —             | Motor M2 (FR) +/- terminals                    |
 | PCA9685 channels CH4/CH5       | (on shield)    | —             | Motor M3 (RL) +/- terminals                    |
 | PCA9685 channels CH6/CH7       | (on shield)    | —             | Motor M4 (RR) +/- terminals                    |
 | PCA9685 channels CH8..CH15     | (on shield)    | —             | Servo headers S1..S8 (50 Hz **not** active — see Hardware quirks) |
-| Status LED                     | row1/col1      | `P0.21`/`P0.28`| Lit while a motion ≠ 0, or solid in diagnostic mode |
 
 > **Wheel layout (top view, motor → corner mapping):**
 > `M1 = front-left`, `M2 = front-right`, `M3 = rear-left`, `M4 = rear-right`.
@@ -700,11 +763,14 @@ cargo make clean              # cargo clean
    to ±100**, so the buttons act as fine trim on top of the stick.
 8. Letting go of all inputs immediately sends `(0, 0, 0)`; the car halts.
 9. The car also halts on its own if it stops hearing from the controller
-   for `FAILSAFE_TIMEOUT_MS` (500 ms, see
-   [Failsafe behaviour](#failsafe-behaviour)). The controller in turn
-   flips its RGB indicator to red after `HEARTBEAT_TIMEOUT_MS` (600 ms),
-   so you get a visual cue on the controller that the link is gone
-   before you wonder why the car stopped responding.
+   for `MOTION_EXPIRY_MS` (60 ms, ≈ 3 missed motion frames) — and as a
+   secondary safety, after `FAILSAFE_TIMEOUT_MS` (200 ms) of any radio
+   silence at all (see [Failsafe behaviour](#failsafe-behaviour)). When
+   that happens the **RGB strip on P16 turns dim red**. The controller
+   in turn flips its on-shield RGB LED0 to red after
+   `HEARTBEAT_TIMEOUT_MS` (600 ms), so you get a visual cue on **both**
+   boards that the link is gone before you wonder why the car stopped
+   responding.
 
 ---
 
@@ -734,7 +800,7 @@ cargo make clean              # cargo clean
 | Spinning instead of strafing when pushing the stick sideways           | Two diagonally-opposite wheels are reversed                                                   | Identify the pair from the `defmt` motor logs and flip both                                                                          |
 | Car keeps creeping after you let go of the stick                       | Joystick centre is offset (manufacturing tolerance) and exceeds `DEAD_ZONE`                   | Increase `DEAD_ZONE` in `controller/src/joystick.rs` (try `40`)                                                                      |
 | Tilt mode feels too sensitive / not sensitive enough                   | `FULL_TILT` doesn't match how far you actually tilt                                           | Tweak `FULL_TILT` and `DEAD_ZONE` in `controller/src/tilt.rs`                                                                        |
-| Car halts every ~500 ms even with the stick held                       | Failsafe firing — controller→car link is dropping packets                                     | Move the boards closer, change `RADIO_CHANNEL`, raise `TX_POWER` in `radio-core/src/lib.rs`, or relax `FAILSAFE_TIMEOUT_MS` in `car/src/main.rs` |
+| Car halts every ~60 ms even with the stick held (RGB strip dim-red)    | Motion-expiry failsafe firing — controller→car link is dropping packets                       | Move the boards closer, change `RADIO_CHANNEL`, raise `TX_POWER` in `radio-core/src/lib.rs`, or relax `MOTION_EXPIRY_MS` / `FAILSAFE_TIMEOUT_MS` in `car/src/main.rs` |
 | Car spins / strafes wrong, but you can't tell which wheel is at fault  | Hard to diagnose under joystick control                                                       | Power-cycle and tap the **A button** within 2 s to enter [Diagnostic mode](#diagnostic-mode), then watch which wheel turns when      |
 | Continuous low buzz / hum from the chassis even at rest                | PCA9685 carrier reverted to 50 Hz, or `P0_02` left floating with the buzzer switch ON         | Verify `DEFAULT_PWM_FREQ_HZ = 1500` in `car/src/pca9685.rs`, and that `Output::new(p.P0_02, Level::Low, ...)` is still in `main.rs` (see [Hardware quirks](#hardware-quirks-buzzer--pwm-carrier)) |
 | `cargo build` fails with **"target 'thumbv7em-none-eabihf' not found"** | Cross-compile target missing                                                                  | `rustup target add thumbv7em-none-eabihf`                                                                                            |
