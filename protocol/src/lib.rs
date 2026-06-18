@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod display;
+
 // Radio protocol for micro:bit communication
 // Uses 2.4GHz radio for wireless communication between car and controller
 // Designed for Mecanum wheel omnidirectional car

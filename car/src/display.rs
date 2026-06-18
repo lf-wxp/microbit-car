@@ -1,19 +1,20 @@
-//! 5x5 LED matrix display driver (micro:bit v2 controller side).
+//! 5x5 LED matrix display driver (micro:bit v2 car side).
 //!
-//! This module handles the hardware-level LED matrix multiplexing driver.
-//! Pattern rendering logic has been extracted to [`protocol::display`]; this
-//! module only handles GPIO scanning and frame buffer updates.
+//! Similar to the controller side, this module renders the current motion
+//! state as a directional indicator pattern on the car's on-board 5x5 LED
+//! matrix. Pattern rendering logic comes from the shared module
+//! [`protocol::display`].
 //!
-//! # Multiplexing
+//! # Hardware Connections
 //!
-//! The matrix is wired as 5 anode rows + 5 cathode columns. To light pixel
-//! `(r, c)`, drive `ROW[r]` high and `COL[c]` low while turning off the rest.
-//! One row is scanned at a time, yielding a refresh rate of ~500 Hz (400 µs
-//! per row), well above the human flicker perception threshold.
+//! micro:bit v2 LED matrix pins (same as controller):
+//! - ROW1-5: P0.21, P0.22, P0.15, P0.24, P0.19 (anode, active-high)
+//! - COL1-5: P0.28, P0.11, P0.31, P1.05, P0.30 (cathode, active-low)
 //!
-//! The frame buffer is updated when [`DISPLAY_CHANNEL`] receives a new
-//! [`MotionPayload`]; rendering and scanning are decoupled so that bursty
-//! motion updates do not starve the multiplexer.
+//! # Usage
+//!
+//! Call [`init`] in `main` to initialize pins, then spawn [`display_task`].
+//! The main loop sends `MotionPayload` updates via [`DISPLAY_CHANNEL`].
 
 use embassy_futures::select::{Either, select};
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
@@ -29,7 +30,7 @@ use protocol::display::{self, CENTRE_DOT, Frame};
 /// Per-row scan dwell time. 5 rows × 400 µs = 2 ms full frame, i.e. ~500 Hz refresh.
 const SCAN_INTERVAL_US: u64 = 400;
 
-/// Channel receiving the latest motion command from the fusion loop.
+/// Channel for receiving the latest motion command from the main loop.
 /// Capacity of 1 combined with `try_send` semantics on the producer side
 /// ensures the buffer always holds the most recent value.
 pub static DISPLAY_CHANNEL: Channel<CriticalSectionRawMutex, MotionPayload, 1> = Channel::new();
@@ -41,7 +42,7 @@ pub struct MatrixPins {
 }
 
 /// Configure all 10 matrix pins as push-pull outputs, initially "off"
-/// (rows low, columns high).
+/// (rows low, cols high).
 #[allow(clippy::too_many_arguments)]
 pub fn init(
   row1: Peri<'static, peripherals::P0_21>,
@@ -69,7 +70,7 @@ pub fn init(
     Output::new(col4, Level::High, OutputDrive::Standard),
     Output::new(col5, Level::High, OutputDrive::Standard),
   ];
-  info!("LED matrix initialized (5x5)");
+  info!("Car LED matrix initialized (5x5)");
   MatrixPins { rows, cols }
 }
 
@@ -77,7 +78,7 @@ pub fn init(
 /// for new motion updates on [`DISPLAY_CHANNEL`].
 #[embassy_executor::task]
 pub async fn display_task(pins: MatrixPins) {
-  info!("Display task started");
+  info!("Car display task started");
   let MatrixPins { mut rows, mut cols } = pins;
 
   let mut current: Frame = CENTRE_DOT;
@@ -98,7 +99,7 @@ pub async fn display_task(pins: MatrixPins) {
         let next = display::motion_to_frame(&payload);
         if next != current {
           trace!(
-            "Display: vx={}, vy={}, omega={} -> new frame",
+            "Car display: vx={}, vy={}, omega={} -> new frame",
             payload.vx, payload.vy, payload.omega
           );
           current = next;
@@ -117,7 +118,6 @@ fn light_row(
   row_idx: usize,
   row: &[bool; 5],
 ) {
-  // Only let `row_idx` row output high.
   for (i, pin) in rows.iter_mut().enumerate() {
     if i == row_idx {
       pin.set_high();
@@ -125,7 +125,6 @@ fn light_row(
       pin.set_low();
     }
   }
-  // Cathode low = lit, cathode high = off.
   for (i, pin) in cols.iter_mut().enumerate() {
     if row[i] {
       pin.set_low();

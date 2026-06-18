@@ -2,6 +2,7 @@
 #![no_main]
 
 mod diagnostic;
+mod display;
 mod light;
 mod motor;
 mod motorbit;
@@ -91,9 +92,14 @@ async fn main(spawner: Spawner) {
   // would drop it immediately and free the pin.
   let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
 
-  // LED row 1, col 1 on micro:bit v2 (top-left LED) - status indicator
-  let mut led_col1 = Output::new(p.P0_28, Level::Low, OutputDrive::Standard);
-  let mut _led_row1 = Output::new(p.P0_21, Level::High, OutputDrive::Standard);
+  // Initialize the on-board 5x5 LED matrix and spawn the display task.
+  // Pin assignments come from the official micro:bit v2 schematic:
+  //   ROW1=P0.21, ROW2=P0.22, ROW3=P0.15, ROW4=P0.24, ROW5=P0.19
+  //   COL1=P0.28, COL2=P0.11, COL3=P0.31, COL4=P1.05, COL5=P0.30
+  let matrix = display::init(
+    p.P0_21, p.P0_22, p.P0_15, p.P0_24, p.P0_19, p.P0_28, p.P0_11, p.P0_31, p.P1_05, p.P0_30,
+  );
+  spawner.spawn(display::display_task(matrix).unwrap());
 
   info!("Car firmware started");
 
@@ -106,7 +112,8 @@ async fn main(spawner: Spawner) {
     // with the controlled motor sweep. `diagnostic::run` is divergent
     // (`-> !`), so control never returns from this branch.
     let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
-    led_col1.set_high();
+    // Light up the matrix to indicate diagnostic mode is active.
+    let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::forward(100));
     diagnostic::run(&mut motor_driver).await;
   }
 
@@ -169,12 +176,13 @@ async fn main(spawner: Spawner) {
           failsafe_engaged = false;
           motion_received = true;
 
-          // LED indicates whether the chassis is currently commanded to move.
+          // Update the 5x5 LED matrix with the current motion direction.
+          let _ = display::DISPLAY_CHANNEL.try_send(motion);
+
+          // External lights: on when stopped, off when moving.
           if motion.vx != 0 || motion.vy != 0 || motion.omega != 0 {
-            led_col1.set_high();
             light.light_off();
           } else {
-            led_col1.set_low();
             light.light_on();
           }
 
@@ -190,7 +198,8 @@ async fn main(spawner: Spawner) {
               MOTION_EXPIRY_MS
             );
             motor_driver.stop_all().await;
-            led_col1.set_low();
+            // Show idle pattern on the LED matrix.
+            let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::stop());
             failsafe_engaged = true;
           }
         }
@@ -212,7 +221,8 @@ async fn main(spawner: Spawner) {
             elapsed, last_rx
           );
           motor_driver.stop_all().await;
-          led_col1.set_low();
+          // Show idle pattern on the LED matrix.
+          let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::stop());
           failsafe_engaged = true;
         }
       }
