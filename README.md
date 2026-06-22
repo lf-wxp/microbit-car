@@ -434,16 +434,16 @@ let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
 let matrix = display::init(/* ROW1..ROW5, COL1..COL5 */);
 spawner.spawn(display::display_task(matrix).unwrap());
 
-// 4-LED WS2812 strip on P16 (P1_02): single colour per motion state.
-let mut rgb_strip = rgb::init(p.P1_02);
+// 4-LED WS2812 strip on P16 (P1_02) via PWM0 + EasyDMA.
+let mut rgb_strip = rgb::RgbStrip::new(p.PWM0, p.P1_02);
 rgb_strip.clear();
-rgb_strip.show();
+rgb_strip.show().await;
 
 // Optional: tap the A button (P0_14) within the first 2 s to enter
 // the motor wiring diagnostic instead of the normal radio loop.
 if diagnostic::is_diagnostic_requested(p.P0_14).await {
     let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
-    rgb_strip.set_all(rgb::Color::CYAN); rgb_strip.show(); // diagnostic marker
+    rgb_strip.set_all(rgb::Color::CYAN); rgb_strip.show().await; // diagnostic marker
     diagnostic::run(&mut motor_driver).await; // -> !
 }
 
@@ -463,14 +463,14 @@ loop {
             display::DISPLAY_CHANNEL.try_send(motion).ok();
             if motion.is_zero() { light.light_on(); } else { light.light_off(); }
             rgb_strip.set_all(motion_to_rgb(&motion));
-            rgb_strip.show();
+            rgb_strip.show().await;
             motor_driver.apply_motion(&motion).await;
         }
         // ─── Motion expired (≥ 60 ms with no fresh command) ───
         Either::First(Either::Second(_)) => {
             motor_driver.stop_all().await;
             rgb_strip.set_all(rgb::Color::new(32, 0, 0)); // dim red
-            rgb_strip.show();
+            rgb_strip.show().await;
         }
         // ─── Global watchdog tick (no RX of any kind ≥ 200 ms) ───
         Either::Second(_) => failsafe_if_link_lost(&mut motor_driver, &mut rgb_strip).await,
@@ -495,10 +495,10 @@ loop {
   status LEDs (P0_17 left, P0_13 active-low). The main loop turns them
   **on when the motion vector is zero** and off otherwise, giving a
   visible "I'm stopped / I'm moving" cue from across the room.
-- **`rgb::RgbStrip`** bit-bangs four WS2812 LEDs on P16 (`P1_02`) inside
-  a critical section so interrupt latency cannot break the 800 kHz
-  line. The main loop maps each motion vector to a single colour via
-  `motion_to_rgb`:
+- **`rgb::RgbStrip`** drives four WS2812 LEDs on P16 (`P1_02`) using the
+  nRF52833's `PWM0` peripheral with EasyDMA, so the strict 800 kHz
+  timing is met entirely in hardware without CPU bit-banging. The main
+  loop maps each motion vector to a single colour via `motion_to_rgb`:
   - dim white = idle (all axes inside the dead-zone),
   - green / red = forward / backward dominant,
   - blue / yellow = strafe left / right,
@@ -650,7 +650,7 @@ put servos on a separate driver) — most hobby servos won't tolerate
 | I²C SDA → PCA9685              | **P20**        | `P1.00`       | TWIM0                                          |
 | **A button** (diagnostic mode) | on-board       | `P0.14`       | Active-low, internal `Pull::Up`; tap within 2 s of boot |
 | **Buzzer line** (held low)     | **P0**         | `P0.02`       | GPIO Output Low; silences MotorBit buzzer      |
-| **WS2812 RGB strip** (×4)      | **P16**        | `P1.02`       | Bit-banged ~800 kHz, motion-state colour       |
+| **WS2812 RGB strip** (×4)      | **P16**        | `P1.02`       | PWM0 / EasyDMA, WS2812 800 kHz, motion-state colour |
 | **Left status LED**            | **P1**         | `P0.17`       | GPIO Output, active-low; on when stopped       |
 | **Right status LED**           | **P2**         | `P0.13`       | GPIO Output, active-low; on when stopped       |
 | 5×5 LED matrix ROW1..ROW5      | on-board       | `P0.21`/`P0.22`/`P0.15`/`P0.24`/`P0.19` | GPIO Output, multiplexed by `display_task` |

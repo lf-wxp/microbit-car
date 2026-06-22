@@ -364,16 +364,16 @@ let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
 let matrix = display::init(/* ROW1..ROW5, COL1..COL5 */);
 spawner.spawn(display::display_task(matrix).unwrap());
 
-// P16 (P1_02) 上的 4 颗 WS2812 RGB 全彩灯：每种运动状态对应一个颜色。
-let mut rgb_strip = rgb::init(p.P1_02);
+// P16 (P1_02) 上的 4 颗 WS2812 RGB 全彩灯，通过 PWM0 + EasyDMA 硬件驱动。
+let mut rgb_strip = rgb::RgbStrip::new(p.PWM0, p.P1_02);
 rgb_strip.clear();
-rgb_strip.show();
+rgb_strip.show().await;
 
 // 可选：在上电后前 2 秒内点击 A 按钮（P0_14）
 // 进入电机接线诊断模式，而不是正常的无线电循环。
 if diagnostic::is_diagnostic_requested(p.P0_14).await {
     let mut motor_driver = motor::MotorDriver::new(p.TWISPI0, p.P0_26, p.P1_00).await;
-    rgb_strip.set_all(rgb::Color::CYAN); rgb_strip.show(); // 诊断模式标记
+    rgb_strip.set_all(rgb::Color::CYAN); rgb_strip.show().await; // 诊断模式标记
     diagnostic::run(&mut motor_driver).await; // -> !
 }
 
@@ -393,14 +393,14 @@ loop {
             display::DISPLAY_CHANNEL.try_send(motion).ok();
             if motion.is_zero() { light.light_on(); } else { light.light_off(); }
             rgb_strip.set_all(motion_to_rgb(&motion));
-            rgb_strip.show();
+            rgb_strip.show().await;
             motor_driver.apply_motion(&motion).await;
         }
         // ─── 运动指令过期（≥ 60 ms 未收到新指令） ───
         Either::First(Either::Second(_)) => {
             motor_driver.stop_all().await;
             rgb_strip.set_all(rgb::Color::new(32, 0, 0)); // 暗红色
-            rgb_strip.show();
+            rgb_strip.show().await;
         }
         // ─── 全局看门狗滴答（任何类型的数据包都没有 ≥ 200 ms） ───
         Either::Second(_) => failsafe_if_link_lost(&mut motor_driver, &mut rgb_strip).await,
@@ -412,7 +412,7 @@ loop {
 - **`MotorDriver::apply_motion`** 运行逆运动学，归一化，将 `[-100..100]` 缩放到 `[-4095..4095]`，然后通过 `MotorBit` → `PCA9685` 堆栈驱动 M1–M4。
 - **`display::display_task`** 在独立任务中运行，从 `Channel` 中消费 `MotionPayload`，多路扫描 5×5 LED 矩阵以绘制与当前方向相符的箭头。渲染器本身位于 [`protocol/src/display.rs`](protocol/src/display.rs)，从而被控制器和小车两侧复用。
 - **`light::Light`** 是对底盘两侧状态 LED（左 P0_17、右 P0_13，低电平点亮）的轻量 GPIO 封装。主循环在**运动向量为零时点亮**它们，运动时熄灭，从而提供一个隔着房间也能看清的 "我已停下 / 我在移动" 视觉提示。
-- **`rgb::RgbStrip`** 在临界区中以位翻转方式驱动 P16 (`P1_02`) 上的 4 颗 WS2812，确保中断延迟不会破坏 800 kHz 的时序。主循环通过 `motion_to_rgb` 把每个运动向量映射成单一颜色：
+- **`rgb::RgbStrip`** 使用 nRF52833 的 `PWM0` 外设配合 EasyDMA 驱动 P16 (`P1_02`) 上的 4 颗 WS2812，由硬件保证严格的 800 kHz 时序，无需 CPU 位翻转。主循环通过 `motion_to_rgb` 把每个运动向量映射成单一颜色：
   - 暗白 = 静止（所有轴都在死区内），
   - 绿 / 红 = 主要前进 / 后退，
   - 蓝 / 黄 = 左 / 右横移为主，
@@ -515,7 +515,7 @@ let _buzzer_silence = Output::new(p.P0_02, Level::Low, OutputDrive::Standard);
 | I²C SDA → PCA9685              | **P20**        | `P1.00`       | TWIM0                                          |
 | **A 按钮**（诊断模式） | 板载       | `P0.14`       | 低电平有效，内部 `Pull::Up`；在启动后 2 秒内点击 |
 | **蜂鸣器线路**（保持低电平）     | **P0**         | `P0.02`       | GPIO 输出低；静音 MotorBit 蜂鸣器      |
-| **WS2812 RGB 灯条**（×4）      | **P16**        | `P1.02`       | 位翻转 ~800 kHz 驱动，按运动状态着色             |
+| **WS2812 RGB 灯条**（×4）      | **P16**        | `P1.02`       | PWM0 / EasyDMA，WS2812 800 kHz，按运动状态着色   |
 | **左侧状态 LED**               | **P1**         | `P0.17`       | GPIO 输出，低电平有效；停止时点亮                  |
 | **右侧状态 LED**               | **P2**         | `P0.13`       | GPIO 输出，低电平有效；停止时点亮                  |
 | 5×5 LED 矩阵 ROW1..ROW5        | 板载            | `P0.21`/`P0.22`/`P0.15`/`P0.24`/`P0.19` | GPIO 输出，由 `display_task` 多路复用扫描 |
