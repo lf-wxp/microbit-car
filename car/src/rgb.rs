@@ -4,7 +4,7 @@
 //! micro:bit v2 edge connector pin P16 (= nRF52833 `P1_02`). The
 //! protocol is single-wire, return-to-zero, with strict ~1.25 µs bit
 //! cells; we generate the waveform by toggling the GPIO inside a
-//! critical section and busy-waiting via `cortex_m::asm::nop` so that
+//! critical section and busy-waiting via inline assembly so that
 //! interrupt latency cannot stretch a bit slot.
 //!
 //! # Wire format
@@ -33,7 +33,6 @@
 //! strip.show();
 //! ```
 
-use cortex_m::asm::delay;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::{Peri, peripherals};
 
@@ -118,6 +117,9 @@ impl RgbStrip {
   /// bit half-period). After the data burst we hold the line low for
   /// > 50 µs so the LEDs latch the new frame.
   pub fn show(&mut self) {
+    // Disable all interrupts via PRIMASK (CPSID i) to guarantee
+    // uninterrupted bit timing. `cortex_m::interrupt::free` does
+    // exactly this on thumbv7em targets.
     cortex_m::interrupt::free(|_| {
       for color in self.buffer.iter() {
         // WS2812 expects G, R, B in that order, MSB first.
@@ -154,35 +156,58 @@ pub fn init(pin: Peri<'static, peripherals::P1_02>) -> RgbStrip {
 // Low-level bit-bang helpers.
 //
 // The nRF52833 runs at 64 MHz, so one CPU cycle is ~15.625 ns.
-// We use `cortex_m::asm::delay(cycles)` which is a tight assembly
-// loop guaranteed to take exactly `cycles` iterations regardless of
-// compiler optimization level. This is critical because a naive
-// `for _ in 0..n { nop() }` loop can be reordered or partially
-// unrolled by LLVM at opt-level ≥ 2, breaking the strict WS2812
-// timing envelope.
+// We use a custom inline assembly delay loop (`subs + bne`) that
+// gives exact cycle-level control regardless of compiler optimization
+// level. This is critical because:
+//   1. A naive `for _ in 0..n { nop() }` loop can be reordered or
+//      partially unrolled by LLVM at opt-level ≥ 2.
+//   2. `cortex_m::asm::delay` has a conservative 1.5× overhead on M4
+//      (it divides by 2 targeting M7's 2-cycle loop, but M4 actually
+//      takes 2 cycles per iteration too, plus the +1 bias).
 //
-// The exact cycle counts below were tuned against the published
+// The exact timing values below were tuned against the published
 // WS2812B timing spec (T0H 0.20–0.50 µs, T1H 0.55–0.85 µs,
 // total cell ≥ 1.25 µs) and include the GPIO toggle latency
-// (~3 cycles for a peripheral store on Cortex-M4).
+// (~2–3 cycles for a peripheral store on Cortex-M4).
 // ---------------------------------------------------------------------
 
-/// CPU frequency in MHz. Used to convert nanoseconds to cycle counts.
+/// CPU frequency in MHz.
 const CPU_MHZ: u32 = 64;
 
-/// Busy-wait for approximately `ns` nanoseconds.
+/// Busy-wait for approximately `ns` nanoseconds using inline assembly.
 ///
-/// Uses `cortex_m::asm::delay` which compiles to a tight `subs + bne`
-/// loop in assembly — immune to compiler reordering or dead-code
-/// elimination at any optimization level.
+/// On Cortex-M4 (nRF52833 @ 64 MHz) the inner loop is:
+///   ```asm
+///   1: subs r0, #1    // 1 cycle
+///      bne  1b        // 1 cycle (taken) or 1 cycle (not-taken on exit)
+///   ```
+/// Each taken iteration costs exactly **2 cycles** on Cortex-M4 (no
+/// pipeline refill penalty for short backward branches on M4). The
+/// final not-taken iteration also costs 1+1 = 2 cycles.
+///
+/// So `iterations` loop iterations ≈ `iterations × 2` CPU cycles.
+/// We compute: iterations = target_cycles / 2 (rounded up).
+///
+/// Unlike `cortex_m::asm::delay` which conservatively divides by 2
+/// *and* adds 1 (designed for superscalar M7), we control the exact
+/// factor here for M4-accurate timing.
 #[inline(always)]
 fn delay_ns(ns: u32) {
-  // cycles = ns * 64 / 1000, rounded up.
-  // The `delay()` loop itself costs 3 cycles per iteration on CM4
-  // (subs=1, bne=1–2), but `cortex_m::asm::delay` already accounts
-  // for that internally — it expects raw cycle count.
-  let cycles = (ns * CPU_MHZ).div_ceil(1000);
-  delay(cycles);
+  // target_cycles = ns × 64 / 1000
+  let target_cycles = (ns * CPU_MHZ).div_ceil(1000);
+  // Each loop iteration = 2 cycles on Cortex-M4.
+  let iterations = target_cycles / 2;
+  if iterations > 0 {
+    unsafe {
+      core::arch::asm!(
+        "1:",
+        "subs {0}, #1",
+        "bne 1b",
+        inout(reg) iterations => _,
+        options(nomem, nostack),
+      );
+    }
+  }
 }
 
 /// Clock one byte out, MSB first.
@@ -203,25 +228,27 @@ fn write_byte(pin: &mut Output<'static>, byte: u8) {
 
 /// Clock one bit out using the WS2812 NRZ encoding.
 ///
-/// Timing budget per bit cell (1.25 µs = 80 cycles @ 64 MHz):
-///   - T1: high 0.70 µs (45 cyc) + low 0.55 µs (35 cyc)
-///   - T0: high 0.35 µs (22 cyc) + low 0.90 µs (58 cyc)
+/// WS2812B datasheet timing (typical, ±150 ns tolerance):
+///   - T1H: 0.80 µs high  →  T1L: 0.45 µs low
+///   - T0H: 0.40 µs high  →  T0L: 0.85 µs low
+///   - Total bit cell ≈ 1.25 µs
 ///
-/// The GPIO write itself takes ~3 cycles; `delay_ns` values are
-/// trimmed accordingly so the *total* pulse width lands within spec.
+/// The GPIO peripheral write on nRF52833 takes ~2–3 cycles (~47 ns).
+/// The `delay_ns` values below are trimmed to account for this
+/// overhead so the *total* pulse width lands within spec.
 #[inline(always)]
 fn write_bit(pin: &mut Output<'static>, bit: bool) {
   if bit {
-    // T1H ~ 0.70 µs, T1L ~ 0.55 µs.
+    // T1H ≈ 0.80 µs high, T1L ≈ 0.45 µs low.
     pin.set_high();
-    delay_ns(650);
+    delay_ns(700);
     pin.set_low();
-    delay_ns(450);
+    delay_ns(350);
   } else {
-    // T0H ~ 0.35 µs, T0L ~ 0.90 µs.
+    // T0H ≈ 0.40 µs high, T0L ≈ 0.85 µs low.
     pin.set_high();
-    delay_ns(250);
+    delay_ns(300);
     pin.set_low();
-    delay_ns(800);
+    delay_ns(750);
   }
 }
