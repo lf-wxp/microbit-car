@@ -19,6 +19,7 @@ use embassy_nrf::config::{Config, HfclkSource};
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_time::{Duration, Instant, Timer};
 
+
 use defmt::{info, warn};
 
 /// Maximum time (ms) we tolerate without any inbound radio packet
@@ -102,12 +103,13 @@ async fn main(spawner: Spawner) {
   );
   spawner.spawn(display::display_task(matrix).unwrap());
 
-  // Initialize the 4-LED WS2812 RGB strip on edge-connector P16 (P1_02).
+  // Initialize the 4-LED WS2812 RGB strip on edge-connector P16 (P1_02)
+  // using PWM0 + EasyDMA for reliable hardware-driven timing.
   // Start with everything off; the main loop will drive the colors
   // based on motion state below.
-  let mut rgb_strip = rgb::init(p.P1_02);
+  let mut rgb_strip = rgb::RgbStrip::new(p.PWM0, p.P1_02);
   rgb_strip.clear();
-  rgb_strip.show();
+  rgb_strip.show().await;
 
   info!("Car firmware started");
 
@@ -125,7 +127,7 @@ async fn main(spawner: Spawner) {
     // Solid cyan on the RGB strip is an unmistakable "diagnostic mode"
     // marker that doesn't depend on the LED matrix being visible.
     rgb_strip.set_all(rgb::Color::CYAN);
-    rgb_strip.show();
+    rgb_strip.show().await;
     diagnostic::run(&mut motor_driver).await;
   }
 
@@ -206,7 +208,7 @@ async fn main(spawner: Spawner) {
           //   * spin in place   -> magenta
           let rgb_color = motion_to_rgb(&motion);
           rgb_strip.set_all(rgb_color);
-          rgb_strip.show();
+          rgb_strip.show().await;
 
           motor_driver.apply_motion(&motion).await;
         }
@@ -224,7 +226,7 @@ async fn main(spawner: Spawner) {
             let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::stop());
             // Signal failsafe via the RGB strip too (dim red).
             rgb_strip.set_all(rgb::Color::new(32, 0, 0));
-            rgb_strip.show();
+            rgb_strip.show().await;
             failsafe_engaged = true;
           }
         }
@@ -250,7 +252,7 @@ async fn main(spawner: Spawner) {
           let _ = display::DISPLAY_CHANNEL.try_send(protocol::MotionPayload::stop());
           // Signal link-loss failsafe on the RGB strip (dim red).
           rgb_strip.set_all(rgb::Color::new(32, 0, 0));
-          rgb_strip.show();
+          rgb_strip.show().await;
           failsafe_engaged = true;
         }
       }

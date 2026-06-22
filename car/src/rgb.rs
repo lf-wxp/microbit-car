@@ -1,18 +1,27 @@
-//! WS2812 / NeoPixel RGB LED strip driver (bit-bang on P16).
+//! WS2812 / NeoPixel RGB LED strip driver (PWM + EasyDMA on P16).
 //!
 //! Drives a chain of 4 WS2812-compatible RGB LEDs connected to the
-//! micro:bit v2 edge connector pin P16 (= nRF52833 `P1_02`). The
-//! protocol is single-wire, return-to-zero, with strict ~1.25 µs bit
-//! cells; we generate the waveform by toggling the GPIO inside a
-//! critical section and busy-waiting via inline assembly so that
-//! interrupt latency cannot stretch a bit slot.
+//! micro:bit v2 edge connector pin P16 (= nRF52833 `P1_02`).
+//!
+//! Uses the nRF52833's PWM peripheral with EasyDMA to generate the
+//! strict 800 kHz WS2812 timing entirely in hardware — no CPU
+//! bit-banging required. This approach is immune to compiler
+//! optimization levels, interrupt latency, and flash wait states.
+//!
+//! # Timing
+//!
+//! With `prescaler = Div1` the PWM base clock is 16 MHz. We pick
+//! `max_duty = 20` so each PWM period is `20 / 16 MHz = 1.25 µs`,
+//! exactly one WS2812 bit slot. Inside that slot:
+//!
+//! * `T0H` = 5 ticks ≈ 0.31 µs (datasheet window 0.20–0.50 µs)
+//! * `T1H` = 13 ticks ≈ 0.81 µs (datasheet window 0.65–0.95 µs)
 //!
 //! # Wire format
 //!
-//! Each LED consumes 24 bits in `G R B` order, MSB first. A logical
-//! `1` is encoded as ~0.8 µs high + ~0.45 µs low; a logical `0` as
-//! ~0.4 µs high + ~0.85 µs low. After all data has been clocked out
-//! the line must stay low for at least 50 µs to latch the new frame.
+//! Each LED consumes 24 bits in `G R B` order, MSB first. After all
+//! data has been clocked out the line must stay low for at least 50 µs
+//! to latch the new frame.
 //!
 //! # Hardware notes
 //!
@@ -22,19 +31,24 @@
 //!   shifter or a WS2812B variant powered at 3.3 V is recommended for
 //!   reliable operation.
 //! - With only 4 LEDs the total transmission takes
-//!   `4 × 24 × 1.25 µs ≈ 120 µs`, which is short enough to run inside
-//!   a critical section without disturbing radio / motor tasks.
+//!   `4 × 24 × 1.25 µs ≈ 120 µs`, which is negligible.
 //!
 //! # Example
 //!
 //! ```ignore
-//! let mut strip = rgb::init(p.P1_02);
+//! let mut strip = rgb::RgbStrip::new(p.PWM0, p.P1_02);
 //! strip.set_all(rgb::Color::BLUE);
-//! strip.show();
+//! strip.show().await;
 //! ```
 
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
-use embassy_nrf::{Peri, peripherals};
+use embassy_nrf::Peri;
+use embassy_nrf::gpio::{Level, OutputDrive};
+use embassy_nrf::peripherals;
+use embassy_nrf::pwm::{
+  Config as PwmConfig, Prescaler, SequenceConfig, SequenceLoad, SequencePwm, SingleSequenceMode,
+  SingleSequencer,
+};
+use embassy_time::{Duration, Timer};
 
 use defmt::info;
 
@@ -77,17 +91,80 @@ impl Color {
   }
 }
 
-/// 4-LED WS2812 RGB strip driver.
+// --- PWM timing constants -------------------------------------------
+
+/// PWM TOP value: 20 ticks at 16 MHz = 1.25 µs per bit slot.
+const TOP_TICKS: u16 = 20;
+/// Duty ticks for a logical `0` bit (T0H ≈ 0.31 µs).
+const T0H_TICKS: u16 = 5;
+/// Duty ticks for a logical `1` bit (T1H ≈ 0.81 µs).
+const T1H_TICKS: u16 = 13;
+
+/// PWM duty word for a logical `0` bit.
+///
+/// Bit 15 is the polarity flag: setting it makes the line high while
+/// `counter < duty`, which is the polarity WS2812 wants (a short high
+/// pulse at the start of every bit slot).
+const WORD_T0: u16 = 0x8000 | T0H_TICKS;
+/// PWM duty word for a logical `1` bit.
+const WORD_T1: u16 = 0x8000 | T1H_TICKS;
+
+/// 24 bits per LED (G, R, B).
+const BITS_PER_LED: usize = 24;
+/// Total PWM word count for one full frame.
+const FRAME_WORDS: usize = LED_COUNT * BITS_PER_LED;
+
+/// WS2812 latch / reset window, datasheet says ≥ 50 µs. We use 80 µs
+/// for generous margin.
+const RESET_US: u64 = 80;
+/// Approximate time per bit in µs (rounded up for safety).
+const BIT_PERIOD_US: u64 = 2;
+/// Total frame busy time: data + latch.
+const FRAME_BUSY_US: u64 = (FRAME_WORDS as u64) * BIT_PERIOD_US + RESET_US;
+
+// --- Driver ---------------------------------------------------------
+
+/// 4-LED WS2812 RGB strip driver using PWM + EasyDMA.
 ///
 /// Buffers the requested color for each LED and only flushes the
 /// chain when [`RgbStrip::show`] is called, allowing the caller to
 /// stage multi-LED updates without intermediate flicker.
 pub struct RgbStrip {
-  pin: Output<'static>,
-  buffer: [Color; LED_COUNT],
+  pwm: SequencePwm<'static>,
+  buf: [u16; FRAME_WORDS],
+  colors: [Color; LED_COUNT],
 }
 
 impl RgbStrip {
+  /// Create a new RGB strip driver on PWM0 / P1_02.
+  ///
+  /// Configures the PWM peripheral for WS2812 timing and starts with
+  /// all LEDs off.
+  pub fn new(
+    pwm: Peri<'static, peripherals::PWM0>,
+    pin: Peri<'static, peripherals::P1_02>,
+  ) -> Self {
+    let mut config = PwmConfig::default();
+    config.prescaler = Prescaler::Div1;
+    config.max_duty = TOP_TICKS;
+    config.sequence_load = SequenceLoad::Common;
+    // High-drive output keeps the WS2812 logic threshold solidly met
+    // even with a few cm of jumper cable.
+    config.ch0_drive = OutputDrive::HighDrive;
+    config.ch0_idle_level = Level::Low;
+
+    let pwm = SequencePwm::new_1ch(pwm, pin, config)
+      .expect("SequencePwm::new_1ch failed (P1_02 / PWM0)");
+
+    info!("RGB strip initialized on P16 (P1_02), {} LEDs via PWM0", LED_COUNT);
+
+    Self {
+      pwm,
+      buf: [WORD_T0; FRAME_WORDS],
+      colors: [Color::BLACK; LED_COUNT],
+    }
+  }
+
   /// Set one LED's color in the buffer. Out-of-range indices are
   /// silently ignored so the caller doesn't have to bounds-check.
   #[allow(dead_code)] // Per-LED API; main currently only calls `set_all`.
@@ -95,12 +172,12 @@ impl RgbStrip {
     if index >= LED_COUNT {
       return;
     }
-    self.buffer[index] = color;
+    self.colors[index] = color;
   }
 
   /// Fill every LED with the same color.
   pub fn set_all(&mut self, color: Color) {
-    for c in self.buffer.iter_mut() {
+    for c in self.colors.iter_mut() {
       *c = color;
     }
   }
@@ -110,145 +187,35 @@ impl RgbStrip {
     self.set_all(Color::BLACK);
   }
 
-  /// Push the buffered colors out to the chain.
+  /// Push the buffered colors out to the chain via DMA.
   ///
-  /// Runs inside a critical section to keep bit timing within spec
-  /// (interrupt latency on this MCU can easily exceed a single 0.4 µs
-  /// bit half-period). After the data burst we hold the line low for
-  /// > 50 µs so the LEDs latch the new frame.
-  pub fn show(&mut self) {
-    // Disable all interrupts via PRIMASK (CPSID i) to guarantee
-    // uninterrupted bit timing. `cortex_m::interrupt::free` does
-    // exactly this on thumbv7em targets.
-    cortex_m::interrupt::free(|_| {
-      for color in self.buffer.iter() {
-        // WS2812 expects G, R, B in that order, MSB first.
-        write_byte(&mut self.pin, color.g);
-        write_byte(&mut self.pin, color.r);
-        write_byte(&mut self.pin, color.b);
-      }
-    });
-    // Reset / latch: line must stay low for >= 50 µs. We use 80 µs to
-    // leave generous margin against clock jitter.
-    self.pin.set_low();
-    delay_ns(80_000);
-  }
-}
-
-/// Initialize the RGB strip driver on the given GPIO pin.
-///
-/// The pin is configured as a high-drive push-pull output starting
-/// low so the LEDs see a stable idle level before the first frame.
-pub fn init(pin: Peri<'static, peripherals::P1_02>) -> RgbStrip {
-  // `HighDrive0Standard1` would be subtly wrong for WS2812 (which
-  // wants strong drive in *both* directions to fight line capacitance);
-  // `Standard` is the safe default and works well for 4 LEDs at 30 cm.
-  let pin = Output::new(pin, Level::Low, OutputDrive::Standard);
-  let strip = RgbStrip {
-    pin,
-    buffer: [Color::BLACK; LED_COUNT],
-  };
-  info!("RGB strip initialized on P16 (P1_02), {} LEDs", LED_COUNT);
-  strip
-}
-
-// ---------------------------------------------------------------------
-// Low-level bit-bang helpers.
-//
-// The nRF52833 runs at 64 MHz, so one CPU cycle is ~15.625 ns.
-// We use a custom inline assembly delay loop (`subs + bne`) that
-// gives exact cycle-level control regardless of compiler optimization
-// level. This is critical because:
-//   1. A naive `for _ in 0..n { nop() }` loop can be reordered or
-//      partially unrolled by LLVM at opt-level ≥ 2.
-//   2. `cortex_m::asm::delay` has a conservative 1.5× overhead on M4
-//      (it divides by 2 targeting M7's 2-cycle loop, but M4 actually
-//      takes 2 cycles per iteration too, plus the +1 bias).
-//
-// The exact timing values below were tuned against the published
-// WS2812B timing spec (T0H 0.20–0.50 µs, T1H 0.55–0.85 µs,
-// total cell ≥ 1.25 µs) and include the GPIO toggle latency
-// (~2–3 cycles for a peripheral store on Cortex-M4).
-// ---------------------------------------------------------------------
-
-/// CPU frequency in MHz.
-const CPU_MHZ: u32 = 64;
-
-/// Busy-wait for approximately `ns` nanoseconds using inline assembly.
-///
-/// On Cortex-M4 (nRF52833 @ 64 MHz) the inner loop is:
-///   ```asm
-///   1: subs r0, #1    // 1 cycle
-///      bne  1b        // 1 cycle (taken) or 1 cycle (not-taken on exit)
-///   ```
-/// Each taken iteration costs exactly **2 cycles** on Cortex-M4 (no
-/// pipeline refill penalty for short backward branches on M4). The
-/// final not-taken iteration also costs 1+1 = 2 cycles.
-///
-/// So `iterations` loop iterations ≈ `iterations × 2` CPU cycles.
-/// We compute: iterations = target_cycles / 2 (rounded up).
-///
-/// Unlike `cortex_m::asm::delay` which conservatively divides by 2
-/// *and* adds 1 (designed for superscalar M7), we control the exact
-/// factor here for M4-accurate timing.
-#[inline(always)]
-fn delay_ns(ns: u32) {
-  // target_cycles = ns × 64 / 1000
-  let target_cycles = (ns * CPU_MHZ).div_ceil(1000);
-  // Each loop iteration = 2 cycles on Cortex-M4.
-  let iterations = target_cycles / 2;
-  if iterations > 0 {
-    unsafe {
-      core::arch::asm!(
-        "1:",
-        "subs {0}, #1",
-        "bne 1b",
-        inout(reg) iterations => _,
-        options(nomem, nostack),
-      );
+  /// This encodes the color buffer into PWM duty words and kicks off
+  /// a hardware DMA transfer. The function awaits until the transfer
+  /// completes and the WS2812 latch window has elapsed.
+  pub async fn show(&mut self) {
+    // Encode colors into PWM buffer.
+    for (led_idx, color) in self.colors.iter().enumerate() {
+      let base = led_idx * BITS_PER_LED;
+      write_byte(&mut self.buf[base..base + 8], color.g);
+      write_byte(&mut self.buf[base + 8..base + 16], color.r);
+      write_byte(&mut self.buf[base + 16..base + 24], color.b);
     }
+
+    // Start DMA transfer.
+    let cfg = SequenceConfig::default();
+    let sequencer = SingleSequencer::new(&mut self.pwm, &self.buf, cfg);
+    // Ignore errors — if PWM fails there's nothing we can do.
+    let _ = sequencer.start(SingleSequenceMode::Times(1));
+
+    // Wait for the frame to finish plus the WS2812 latch window.
+    Timer::after(Duration::from_micros(FRAME_BUSY_US)).await;
   }
 }
 
-/// Clock one byte out, MSB first.
-#[inline(always)]
-fn write_byte(pin: &mut Output<'static>, byte: u8) {
-  // Manual unroll keeps the per-bit critical path tight; a `for` loop
-  // with a runtime mask noticeably stretches T0H past the 0.5 µs limit
-  // on debug builds.
-  write_bit(pin, byte & 0x80 != 0);
-  write_bit(pin, byte & 0x40 != 0);
-  write_bit(pin, byte & 0x20 != 0);
-  write_bit(pin, byte & 0x10 != 0);
-  write_bit(pin, byte & 0x08 != 0);
-  write_bit(pin, byte & 0x04 != 0);
-  write_bit(pin, byte & 0x02 != 0);
-  write_bit(pin, byte & 0x01 != 0);
-}
-
-/// Clock one bit out using the WS2812 NRZ encoding.
-///
-/// WS2812B datasheet timing (typical, ±150 ns tolerance):
-///   - T1H: 0.80 µs high  →  T1L: 0.45 µs low
-///   - T0H: 0.40 µs high  →  T0L: 0.85 µs low
-///   - Total bit cell ≈ 1.25 µs
-///
-/// The GPIO peripheral write on nRF52833 takes ~2–3 cycles (~47 ns).
-/// The `delay_ns` values below are trimmed to account for this
-/// overhead so the *total* pulse width lands within spec.
-#[inline(always)]
-fn write_bit(pin: &mut Output<'static>, bit: bool) {
-  if bit {
-    // T1H ≈ 0.80 µs high, T1L ≈ 0.45 µs low.
-    pin.set_high();
-    delay_ns(700);
-    pin.set_low();
-    delay_ns(350);
-  } else {
-    // T0H ≈ 0.40 µs high, T0L ≈ 0.85 µs low.
-    pin.set_high();
-    delay_ns(300);
-    pin.set_low();
-    delay_ns(750);
+/// Convert one colour byte to 8 PWM duty words, MSB first.
+fn write_byte(slot: &mut [u16], byte: u8) {
+  for (i, word) in slot.iter_mut().enumerate().take(8) {
+    let bit_high = (byte >> (7 - i)) & 1 != 0;
+    *word = if bit_high { WORD_T1 } else { WORD_T0 };
   }
 }
